@@ -433,9 +433,15 @@ static double ffprobe_duration_seconds(const char *path) {
 
 typedef struct {
   char openai_key[512];
+  char deepseek_api_key[512];
+  char llm_provider[32];     /* "openai" (default) or "deepseek" */
+  char open_api_base[512];   /* optional OpenAI-compatible base URL (e.g. DeepSeek) */
+  char open_model[256];      /* optional model override (e.g. deepseek-chat) */
   char eleven_key[512];
   char eleven_voice_id[128];
   char eleven_model_id[128];
+  char tts_provider[32];     /* "elevenlabs" (default) or "edge" */
+  char edge_voice[128];      /* Edge TTS voice, e.g. en-US-ChristopherNeural */
 } Config;
 
 static Config load_config_json(const char *path) {
@@ -448,17 +454,51 @@ static Config load_config_json(const char *path) {
   if (!root) die("config.json parse failed");
 
   const cJSON *ok  = cJSON_GetObjectItemCaseSensitive(root, "open_api_key");
+  const cJSON *dsk = cJSON_GetObjectItemCaseSensitive(root, "deepseek_api_key");
+  const cJSON *lp  = cJSON_GetObjectItemCaseSensitive(root, "llm_provider");
+  const cJSON *ab  = cJSON_GetObjectItemCaseSensitive(root, "open_api_base");
+  const cJSON *om  = cJSON_GetObjectItemCaseSensitive(root, "open_model");
   const cJSON *ek  = cJSON_GetObjectItemCaseSensitive(root, "elevenlabs_api_key");
   const cJSON *vid = cJSON_GetObjectItemCaseSensitive(root, "eleven_voice_id");
   const cJSON *mid = cJSON_GetObjectItemCaseSensitive(root, "eleven_model_id");
+  const cJSON *tp  = cJSON_GetObjectItemCaseSensitive(root, "tts_provider");
+  const cJSON *ev  = cJSON_GetObjectItemCaseSensitive(root, "edge_voice");
 
   if (cJSON_IsString(ok)  && ok->valuestring)  strncpy(c.openai_key, ok->valuestring, sizeof(c.openai_key)-1);
+  if (cJSON_IsString(dsk) && dsk->valuestring) strncpy(c.deepseek_api_key, dsk->valuestring, sizeof(c.deepseek_api_key)-1);
+  if (cJSON_IsString(lp)  && lp->valuestring)  strncpy(c.llm_provider, lp->valuestring, sizeof(c.llm_provider)-1);
+  if (cJSON_IsString(ab)  && ab->valuestring)  strncpy(c.open_api_base, ab->valuestring, sizeof(c.open_api_base)-1);
+  if (cJSON_IsString(om)  && om->valuestring)  strncpy(c.open_model, om->valuestring, sizeof(c.open_model)-1);
   if (cJSON_IsString(ek)  && ek->valuestring)  strncpy(c.eleven_key, ek->valuestring, sizeof(c.eleven_key)-1);
   if (cJSON_IsString(vid) && vid->valuestring) strncpy(c.eleven_voice_id, vid->valuestring, sizeof(c.eleven_voice_id)-1);
   if (cJSON_IsString(mid) && mid->valuestring) strncpy(c.eleven_model_id, mid->valuestring, sizeof(c.eleven_model_id)-1);
+  if (cJSON_IsString(tp)  && tp->valuestring)  strncpy(c.tts_provider, tp->valuestring, sizeof(c.tts_provider)-1);
+  if (cJSON_IsString(ev)  && ev->valuestring)  strncpy(c.edge_voice, ev->valuestring, sizeof(c.edge_voice)-1);
 
-  if (c.openai_key[0] == 0) die("config.json: open_api_key missing");
-  if (c.eleven_key[0] == 0) die("config.json: elevenlabs_api_key missing");
+  if (c.llm_provider[0] == 0) strncpy(c.llm_provider, "openai", sizeof(c.llm_provider)-1);
+  if (c.tts_provider[0] == 0) strncpy(c.tts_provider, "elevenlabs", sizeof(c.tts_provider)-1);
+  if (c.edge_voice[0] == 0)   strncpy(c.edge_voice, "en-US-ChristopherNeural", sizeof(c.edge_voice)-1);
+
+  if (strcasecmp(c.llm_provider, "deepseek") == 0) {
+    if (c.open_api_base[0] == 0) strncpy(c.open_api_base, "https://api.deepseek.com", sizeof(c.open_api_base)-1);
+    if (c.open_model[0] == 0)    strncpy(c.open_model, "deepseek-chat", sizeof(c.open_model)-1);
+    if (c.openai_key[0] == 0)    strncpy(c.openai_key, c.deepseek_api_key, sizeof(c.openai_key)-1);
+  } else if (strcasecmp(c.llm_provider, "openai") != 0) {
+    die("config.json: llm_provider must be \"openai\" or \"deepseek\" (got \"%s\")", c.llm_provider);
+  }
+
+  if (c.openai_key[0] == 0 && c.deepseek_api_key[0] == 0) {
+    die("config.json: open_api_key missing (or deepseek_api_key when using DeepSeek)");
+  }
+
+  if (strcasecmp(c.tts_provider, "edge") == 0) {
+    /* Microsoft Edge TTS: no API key required */
+  } else if (strcasecmp(c.tts_provider, "elevenlabs") == 0) {
+    if (c.eleven_key[0] == 0) die("config.json: elevenlabs_api_key missing (or set \"tts_provider\": \"edge\")");
+  } else {
+    die("config.json: tts_provider must be \"elevenlabs\" or \"edge\" (got \"%s\")", c.tts_provider);
+  }
+
   if (c.eleven_voice_id[0] == 0) strncpy(c.eleven_voice_id, "JBFqnCBsd6RMkjVDRZzb", sizeof(c.eleven_voice_id)-1);
   if (c.eleven_model_id[0] == 0) strncpy(c.eleven_model_id, "eleven_multilingual_v2", sizeof(c.eleven_model_id)-1);
 
@@ -1068,6 +1108,51 @@ static bool openai_resp_should_retry_without_script(const char *resp_json) {
   return yes;
 }
 
+/* ------------- OpenAI-compatible /chat/completions (e.g. DeepSeek) ------------- */
+
+static bool llm_uses_chat_completions(const Config *cfg) {
+  return (cfg->open_api_base[0] != 0) || (strcasecmp(cfg->llm_provider, "deepseek") == 0);
+}
+
+static const char *llm_api_key(const Config *cfg) {
+  return (cfg->openai_key[0] != 0) ? cfg->openai_key : cfg->deepseek_api_key;
+}
+
+static char *llm_chat_extract_message_content(const char *resp_json) {
+  cJSON *root = cJSON_Parse(resp_json);
+  if (!root) return NULL;
+
+  cJSON *err = cJSON_GetObjectItemCaseSensitive(root, "error");
+  if (cJSON_IsObject(err)) {
+    cJSON *msg = cJSON_GetObjectItemCaseSensitive(err, "message");
+    cJSON *typ = cJSON_GetObjectItemCaseSensitive(err, "type");
+    cJSON *cod = cJSON_GetObjectItemCaseSensitive(err, "code");
+    if (cJSON_IsString(msg) && msg->valuestring) logw("LLM error message: %s", msg->valuestring);
+    if (cJSON_IsString(typ) && typ->valuestring) logw("LLM error type: %s", typ->valuestring);
+    if (cJSON_IsString(cod) && cod->valuestring) logw("LLM error code: %s", cod->valuestring);
+    cJSON_Delete(root);
+    return NULL;
+  }
+
+  char *out = NULL;
+  cJSON *choices = cJSON_GetObjectItemCaseSensitive(root, "choices");
+  if (cJSON_IsArray(choices)) {
+    cJSON *ch = cJSON_GetArrayItem(choices, 0);
+    if (cJSON_IsObject(ch)) {
+      cJSON *message = cJSON_GetObjectItemCaseSensitive(ch, "message");
+      if (cJSON_IsObject(message)) {
+        cJSON *content = cJSON_GetObjectItemCaseSensitive(message, "content");
+        if (cJSON_IsString(content) && content->valuestring) {
+          out = strdup(content->valuestring);
+        }
+      }
+    }
+  }
+
+  cJSON_Delete(root);
+  return out;
+}
+
 typedef struct {
   int start;
   int end;
@@ -1282,29 +1367,64 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   free(scr_trim);
 
   cJSON *req = cJSON_CreateObject();
-  cJSON_AddStringToObject(req, "model", "gpt-5.2");
+  char url[1200];
 
-  cJSON *reasoning = cJSON_CreateObject();
-  cJSON_AddStringToObject(reasoning, "effort", "high");
-  cJSON_AddItemToObject(req, "reasoning", reasoning);
+  if (llm_uses_chat_completions(cfg)) {
+    /* OpenAI-compatible /chat/completions endpoint (e.g. DeepSeek) */
+    char base[512];
+    snprintf(base, sizeof(base), "%s",
+             cfg->open_api_base[0] ? cfg->open_api_base : "https://api.deepseek.com");
+    size_t bl = strlen(base);
+    while (bl > 0 && base[bl - 1] == '/') base[--bl] = 0;
+    snprintf(url, sizeof(url), "%s/chat/completions", base);
 
-  cJSON *input = cJSON_CreateArray();
-  cJSON *sys = cJSON_CreateObject();
-  cJSON_AddStringToObject(sys, "role", "system");
-  cJSON_AddStringToObject(sys, "content", "You are a helpful assistant designed to output JSON.");
-  cJSON_AddItemToArray(input, sys);
+    cJSON_AddStringToObject(req, "model", cfg->open_model[0] ? cfg->open_model : "gpt-5.2");
 
-  cJSON *usr = cJSON_CreateObject();
-  cJSON_AddStringToObject(usr, "role", "user");
-  cJSON_AddStringToObject(usr, "content", prompt);
-  cJSON_AddItemToArray(input, usr);
-  cJSON_AddItemToObject(req, "input", input);
+    cJSON *messages = cJSON_CreateArray();
 
-  cJSON *text = cJSON_CreateObject();
-  cJSON *format = cJSON_CreateObject();
-  cJSON_AddStringToObject(format, "type", "json_object");
-  cJSON_AddItemToObject(text, "format", format);
-  cJSON_AddItemToObject(req, "text", text);
+    cJSON *sys = cJSON_CreateObject();
+    cJSON_AddStringToObject(sys, "role", "system");
+    cJSON_AddStringToObject(sys, "content", "You are a helpful assistant designed to output JSON.");
+    cJSON_AddItemToArray(messages, sys);
+
+    cJSON *usr = cJSON_CreateObject();
+    cJSON_AddStringToObject(usr, "role", "user");
+    cJSON_AddStringToObject(usr, "content", prompt);
+    cJSON_AddItemToArray(messages, usr);
+
+    cJSON_AddItemToObject(req, "messages", messages);
+
+    cJSON *rf = cJSON_CreateObject();
+    cJSON_AddStringToObject(rf, "type", "json_object");
+    cJSON_AddItemToObject(req, "response_format", rf);
+  } else {
+    /* OpenAI Responses API (default; unchanged) */
+    snprintf(url, sizeof(url), "%s", "https://api.openai.com/v1/responses");
+
+    cJSON_AddStringToObject(req, "model", "gpt-5.2");
+
+    cJSON *reasoning = cJSON_CreateObject();
+    cJSON_AddStringToObject(reasoning, "effort", "high");
+    cJSON_AddItemToObject(req, "reasoning", reasoning);
+
+    cJSON *input = cJSON_CreateArray();
+    cJSON *sys = cJSON_CreateObject();
+    cJSON_AddStringToObject(sys, "role", "system");
+    cJSON_AddStringToObject(sys, "content", "You are a helpful assistant designed to output JSON.");
+    cJSON_AddItemToArray(input, sys);
+
+    cJSON *usr = cJSON_CreateObject();
+    cJSON_AddStringToObject(usr, "role", "user");
+    cJSON_AddStringToObject(usr, "content", prompt);
+    cJSON_AddItemToArray(input, usr);
+    cJSON_AddItemToObject(req, "input", input);
+
+    cJSON *text = cJSON_CreateObject();
+    cJSON *format = cJSON_CreateObject();
+    cJSON_AddStringToObject(format, "type", "json_object");
+    cJSON_AddItemToObject(text, "format", format);
+    cJSON_AddItemToObject(req, "text", text);
+  }
 
   char *body = cJSON_PrintUnformatted(req);
   cJSON_Delete(req);
@@ -1319,13 +1439,12 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   bool has_script = (optional_script_text && optional_script_text[0] != 0);
   long timeout_s = has_script ? 14400L : 3600L;
 
-  MemBuf resp = http_post_json_to_mem("https://api.openai.com/v1/responses",
-                                      cfg->openai_key, body, &http_code, timeout_s);
+  MemBuf resp = http_post_json_to_mem(url, llm_api_key(cfg), body, &http_code, timeout_s);
   free(body);
 
   if (http_code < 200 || http_code >= 300) {
-    logw("OpenAI HTTP %ld", http_code);
-    if (resp.data && resp.size) logw("OpenAI raw body: %.800s", resp.data);
+    logw("LLM HTTP %ld", http_code);
+    if (resp.data && resp.size) logw("LLM raw body: %.800s", resp.data);
 
     if (has_script && resp.data && openai_resp_should_retry_without_script(resp.data)) {
       if (out_retry_without_script) *out_retry_without_script = true;
@@ -1336,10 +1455,12 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     return empty;
   }
 
-  char *out_text = openai_extract_output_text(resp.data ? resp.data : "");
+  char *out_text = llm_uses_chat_completions(cfg)
+                     ? llm_chat_extract_message_content(resp.data ? resp.data : "")
+                     : openai_extract_output_text(resp.data ? resp.data : "");
   if (!out_text) {
-    logw("OpenAI response parse failed.");
-    if (resp.data && resp.size) logw("OpenAI raw body: %.800s", resp.data);
+    logw("LLM response parse failed.");
+    if (resp.data && resp.size) logw("LLM raw body: %.800s", resp.data);
 
     if (has_script && resp.data && openai_resp_should_retry_without_script(resp.data)) {
       if (out_retry_without_script) *out_retry_without_script = true;
@@ -1409,6 +1530,59 @@ static bool elevenlabs_tts_to_mp3(const Config *cfg, const char *text, const cha
     return false;
   }
   return file_exists(out_mp3_path);
+}
+
+/* ------------- Microsoft Edge TTS (via the `edge-tts` CLI tool) ------------- */
+
+static bool edge_tts_try_tool(const char *tool, const char *txt_esc, const char *voice_esc,
+                              const char *out_esc, const char *out_mp3_path) {
+  char cmd[8192];
+  snprintf(cmd, sizeof(cmd),
+           "%s --file %s --voice %s --write-media %s 2>&1",
+           tool, txt_esc, voice_esc, out_esc);
+
+  char *out = popen_read_all(cmd);
+  bool ok = file_exists(out_mp3_path) && file_size_bytes(out_mp3_path) > 0;
+  if (!ok && out && out[0]) {
+    logw("edge-tts (%s) output: %.400s", tool, out);
+  }
+  if (out) free(out);
+  return ok;
+}
+
+static bool edge_tts_to_mp3(const Config *cfg, const char *text, const char *out_mp3_path) {
+  char tmp_txt[PATH_MAX];
+  snprintf(tmp_txt, sizeof(tmp_txt), "%s.txt", out_mp3_path);
+
+  if (!write_entire_file(tmp_txt, text, strlen(text))) {
+    logw("edge-tts: failed to write temp text file: %s", tmp_txt);
+    return false;
+  }
+
+  char *txt_esc   = sh_escape(tmp_txt);
+  char *voice_esc = sh_escape(cfg->edge_voice);
+  char *out_esc   = sh_escape(out_mp3_path);
+
+  bool ok = edge_tts_try_tool("edge-tts", txt_esc, voice_esc, out_esc, out_mp3_path);
+  if (!ok) ok = edge_tts_try_tool("python3 -m edge_tts", txt_esc, voice_esc, out_esc, out_mp3_path);
+  if (!ok) ok = edge_tts_try_tool("python -m edge_tts", txt_esc, voice_esc, out_esc, out_mp3_path);
+
+  free(txt_esc);
+  free(voice_esc);
+  free(out_esc);
+  unlink(tmp_txt);
+
+  if (!ok) {
+    logw("Edge TTS failed for %s. Install it with: pip install edge-tts", out_mp3_path);
+  }
+  return ok;
+}
+
+static bool tts_to_mp3(const Config *cfg, const char *text, const char *out_mp3_path) {
+  if (strcasecmp(cfg->tts_provider, "edge") == 0) {
+    return edge_tts_to_mp3(cfg, text, out_mp3_path);
+  }
+  return elevenlabs_tts_to_mp3(cfg, text, out_mp3_path);
 }
 
 static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int end_s,
@@ -1780,14 +1954,14 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     logi("No IMSDb script available; using subtitles only.");
   }
 
-  logi("Requesting OpenAI clip plan (%d clips target)...", num_clips);
+  logi("Requesting LLM clip plan (%d clips target)...", num_clips);
   bool retry_no_script = false;
   ClipPlanList plan = openai_make_plan(cfg, movie_title, subs_seconds,
                                        imsdb_script ? imsdb_script : "",
                                        num_clips, &retry_no_script);
 
   if (plan.count == 0 && retry_no_script && imsdb_script && imsdb_script[0]) {
-    logw("OpenAI request failed with IMSDb context; retrying without IMSDb script for %s", movie_title);
+    logw("LLM request failed with IMSDb context; retrying without IMSDb script for %s", movie_title);
     plan = openai_make_plan(cfg, movie_title, subs_seconds, "", num_clips, NULL);
   }
 
@@ -1799,7 +1973,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     free_clip_plan_list(&plan);
     return false;
   }
-  logok("OpenAI plan received: %zu clips", plan.count);
+  logok("LLM plan received: %zu clips", plan.count);
 
   char concat_list_path[PATH_MAX];
   snprintf(concat_list_path, sizeof(concat_list_path), "clips/%s_concat_list.txt", movie_title);
@@ -1822,7 +1996,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     snprintf(nar_mp3, sizeof(nar_mp3), "clips/audio/%s_audio_%zu.mp3", movie_title, i + 1);
 
     logi("TTS clip %zu/%zu -> %s", i + 1, plan.count, nar_mp3);
-    if (!elevenlabs_tts_to_mp3(cfg, plan.items[i].narration, nar_mp3)) {
+    if (!tts_to_mp3(cfg, plan.items[i].narration, nar_mp3)) {
       logw("TTS failed clip %zu for %s", i + 1, movie_title);
       continue;
     }

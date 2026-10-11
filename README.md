@@ -14,8 +14,8 @@ Given a movie file, AI-Movie-Shorts will:
 
 1. **Fetch subtitles (SRT)** automatically (and convert timestamps to seconds)
 2. **Optionally fetch a script** (used only as extra story context)
-3. Ask **OpenAI** to generate a **clip plan** (timestamps + narration per clip)
-4. Use **ElevenLabs** to generate voiceover audio for each clip
+3. Ask **OpenAI** (or **DeepSeek** / any OpenAI-compatible endpoint) to generate a **clip plan** (timestamps + narration per clip)
+4. Use **ElevenLabs** (or **Microsoft Edge TTS**, no API key needed) to generate voiceover audio for each clip
 5. Use **FFmpeg** to:
    - cut each clip
    - time-stretch video to match narration length
@@ -74,6 +74,7 @@ You need:
 - **FFmpeg + ffprobe**
 - **curl**
 - **unzip** (for subtitle downloads)
+- **[`edge-tts`](https://pypi.org/project/edge-tts/)** — only when using `"tts_provider": "edge"` (`pip install edge-tts`)
 - A C toolchain + build system:
   - macOS/Linux: `cmake`, `make` (or Ninja), `pkg-config`
 - Libraries:
@@ -115,6 +116,45 @@ Create `config.json` in the project root:
 Notes:
 - `eleven_voice_id` defaults if omitted.
 - `eleven_model_id` defaults if omitted.
+
+### Using DeepSeek (OpenAI-compatible endpoint)
+
+All keys below are optional — omit them to keep the default OpenAI behavior.
+
+```json
+{
+  "llm_provider": "deepseek",
+  "deepseek_api_key": "YOUR_DEEPSEEK_KEY",
+  "open_api_base": "https://api.deepseek.com",
+  "open_model": "deepseek-chat",
+  "tts_provider": "edge"
+}
+```
+
+Notes:
+- `llm_provider` accepts `"openai"` (default) or `"deepseek"`.
+- `open_api_base` defaults to `https://api.deepseek.com` for DeepSeek. Set it to any OpenAI-compatible base URL to use another provider (the app calls `{base}/chat/completions`).
+- `open_model` defaults to `deepseek-chat` for DeepSeek (use `deepseek-reasoner` for the reasoning model).
+- `deepseek_api_key` is used as the API key (you can also just put the DeepSeek key in `open_api_key`).
+
+### Using Edge TTS (free, no API key)
+
+Set `"tts_provider": "edge"` to narrate with **Microsoft Edge TTS** instead of ElevenLabs. No `elevenlabs_api_key` is required in that case.
+
+```json
+{
+  "tts_provider": "edge",
+  "edge_voice": "en-US-ChristopherNeural"
+}
+```
+
+Notes:
+- `edge_voice` defaults to `en-US-ChristopherNeural`. List all voices with `edge-tts --list-voices`.
+- Edge TTS is driven through the [`edge-tts`](https://pypi.org/project/edge-tts/) CLI tool — install it once with:
+  ```bash
+  pip install edge-tts
+  ```
+- With `"tts_provider": "elevenlabs"` (or omitted), everything works exactly as before.
 
 ---
 
