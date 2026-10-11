@@ -16,6 +16,11 @@
   #include <direct.h>
   #include <io.h>
 
+  #if defined(__MINGW32__) || defined(__MINGW64__)
+    #include <dirent.h>   /* MinGW provides POSIX dirent */
+    #include <strings.h>  /* strcasecmp / strncasecmp */
+  #endif
+
   #ifndef __MINGW32__
     #define strcasecmp  _stricmp
     #define strncasecmp _strnicmp

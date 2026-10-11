@@ -7,8 +7,14 @@
 #include <stdbool.h>
 
 #ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #define NOGDI   /* keep GDI's Rectangle() from clashing with raylib's Rectangle */
+  #define NOUSER  /* keep USER's CloseWindow()/ShowCursor() from clashing with raylib */
   #include <windows.h>
   #include <shellapi.h>
+  #ifndef SW_SHOWNORMAL
+    #define SW_SHOWNORMAL 1
+  #endif
   static CRITICAL_SECTION g_log_lock;
   static void log_lock_init(void) { InitializeCriticalSection(&g_log_lock); }
   static void log_lock(void) { EnterCriticalSection(&g_log_lock); }
