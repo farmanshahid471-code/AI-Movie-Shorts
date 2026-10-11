@@ -455,6 +455,8 @@ typedef struct {
   char eleven_model_id[128];
   char tts_provider[32];     /* "elevenlabs" (default) or "edge" */
   char edge_voice[128];      /* Edge TTS voice, e.g. en-US-ChristopherNeural */
+  int  min_clips;            /* recap length knobs (defaults: 20 / 30) */
+  int  max_clips;
 } Config;
 
 static Config load_config_json(const char *path) {
@@ -514,6 +516,14 @@ static Config load_config_json(const char *path) {
 
   if (c.eleven_voice_id[0] == 0) strncpy(c.eleven_voice_id, "JBFqnCBsd6RMkjVDRZzb", sizeof(c.eleven_voice_id)-1);
   if (c.eleven_model_id[0] == 0) strncpy(c.eleven_model_id, "eleven_multilingual_v2", sizeof(c.eleven_model_id)-1);
+
+  const cJSON *mnc = cJSON_GetObjectItemCaseSensitive(root, "min_clips");
+  const cJSON *mxc = cJSON_GetObjectItemCaseSensitive(root, "max_clips");
+  if (cJSON_IsNumber(mnc) && mnc->valueint > 0) c.min_clips = mnc->valueint;
+  if (cJSON_IsNumber(mxc) && mxc->valueint > 0) c.max_clips = mxc->valueint;
+  if (c.min_clips <= 0) c.min_clips = MIN_NUM_CLIPS;
+  if (c.max_clips <= 0) c.max_clips = MAX_NUM_CLIPS;
+  if (c.max_clips < c.min_clips) c.max_clips = c.min_clips;
 
   cJSON_Delete(root);
   return c;
@@ -1367,6 +1377,9 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "  {\"clips\":[{\"start\":120,\"end\":145,\"narration\":\"...\"}, ...]}\n"
     "- Clips must be increasing by start time.\n"
     "- Each narration must be at least 3 full sentences, casual commentator vibe.\n"
+    "- Use character names ONLY if they appear in INPUT A or INPUT B. Never invent or guess names.\n"
+    "  If a name is not explicitly present, describe the character by role or appearance (e.g. \"the sheriff\", \"her older brother\").\n"
+    "- Never use real actor names; talk about the characters only.\n"
     "- The first narration must start with: \"Here we go, let's go over the movie %s.\".\n";
 
   int plen = snprintf(NULL, 0, prompt_fmt, title_utf8, subs_trim, scr_trim, num_clips, title_utf8);
@@ -1931,15 +1944,15 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
 
   long sz = file_size_bytes(script_txt);
   if (sz >= 0 && sz < 200) {
-    logw("IMSDb script file looks too small (%ld bytes). Deleting to retry: %s", sz, script_txt);
+    logw("Script/transcript file looks too small (%ld bytes). Deleting to retry: %s", sz, script_txt);
     unlink(script_txt);
   }
 
   char imsdb_url[1024] = {0};
   if (file_exists(script_txt)) {
-    logok("Found cached IMSDb script: %s (%ld bytes)", script_txt, file_size_bytes(script_txt));
+    logok("Found script/transcript: %s (%ld bytes)", script_txt, file_size_bytes(script_txt));
   } else {
-    logi("Attempting IMSDb script scrape for %s (optional context)...", movie_title);
+    logi("No script/transcript provided; attempting IMSDb scrape for %s (optional context)...", movie_title);
     if (download_imsdb_script_ex(movie_title, script_txt, imsdb_url, sizeof(imsdb_url))) {
       logok("IMSDb script saved: %s (source: %s)", script_txt, imsdb_url[0] ? imsdb_url : "unknown");
     } else {
@@ -1958,13 +1971,13 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   if (file_exists(script_txt)) {
     imsdb_script = read_entire_file(script_txt);
     if (imsdb_script && strlen(imsdb_script) > 0) {
-      logok("Loaded IMSDb script for extra context: %s (%zu bytes)", script_txt, strlen(imsdb_script));
+      logok("Loaded script/transcript for extra context: %s (%zu bytes)", script_txt, strlen(imsdb_script));
     } else {
       if (imsdb_script) { free(imsdb_script); imsdb_script = NULL; }
-      logw("IMSDb script file existed but was empty/unreadable: %s", script_txt);
+      logw("Script/transcript file existed but was empty/unreadable: %s", script_txt);
     }
   } else {
-    logi("No IMSDb script available; using subtitles only.");
+    logi("No script/transcript available; using subtitles only.");
   }
 
   logi("Requesting LLM clip plan (%d clips target)...", num_clips);
@@ -1974,7 +1987,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
                                        num_clips, &retry_no_script);
 
   if (plan.count == 0 && retry_no_script && imsdb_script && imsdb_script[0]) {
-    logw("LLM request failed with IMSDb context; retrying without IMSDb script for %s", movie_title);
+    logw("LLM request failed with script context; retrying without it for %s", movie_title);
     plan = openai_make_plan(cfg, movie_title, subs_seconds, "", num_clips, NULL);
   }
 
@@ -2199,7 +2212,7 @@ int run_generation(void) {
   ensure_dir("clips/audio");
 
   srand((unsigned)time(NULL));
-  int num_clips = MIN_NUM_CLIPS + (rand() % (MAX_NUM_CLIPS - MIN_NUM_CLIPS + 1));
+  int num_clips = cfg.min_clips + (rand() % (cfg.max_clips - cfg.min_clips + 1));
 
   DIR *d = opendir("movies");
   if (!d) die("Failed to open movies/");

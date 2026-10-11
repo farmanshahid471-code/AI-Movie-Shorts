@@ -116,6 +116,7 @@ Create `config.json` in the project root:
 Notes:
 - `eleven_voice_id` defaults if omitted.
 - `eleven_model_id` defaults if omitted.
+- `min_clips` / `max_clips` control recap length (default 20–30). See **Recap length** below.
 
 ### Using DeepSeek (OpenAI-compatible endpoint)
 
@@ -203,13 +204,33 @@ If no music files exist, output will be narration-only.
 
 ---
 
+## Recap length
+
+The recap lasts roughly `num_clips × 8–15 seconds` of narration. The default
+`min_clips`/`max_clips` of 20–30 gives about **3–5 minutes**. For a longer recap
+(e.g. ~8–10 minutes) add to `config.json`:
+
+```json
+{
+  "min_clips": 45,
+  "max_clips": 60
+}
+```
+
+---
+
 ## Subtitles / script fetching
 
 - Subtitles (SRT) are auto-downloaded when missing.
-- Script fetching is **best effort** and **optional**. If it fails, the program continues with subtitles only.
+- Script/transcript fetching is **best effort** and **optional**. If it fails, the program continues with subtitles only.
 
-If auto-fetch fails, you can manually add:
-- `scripts/srt_files/<MovieTitle>.srt`
+You can provide your own files instead — just drop them in `scripts/srt_files/`:
+
+- **Subtitles**: `scripts/srt_files/<MovieTitle>.srt` (any normal SRT file)
+- **Transcript / script context**: `scripts/srt_files/<MovieTitle>_summary.txt`
+  - Any plain text (screenplay, transcript, plot summary) — must be at least 200 bytes.
+  - Used as extra story context for the LLM.
+  - Greatly improves **character-name accuracy**: the narrator only uses names that appear in your subtitles/transcript, and refers to unnamed characters by role (e.g. “the sheriff”) instead of inventing names.
 
 Then rerun.
 
