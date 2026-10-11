@@ -2368,6 +2368,19 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   return true;
 }
 
+static bool has_video_ext(const char *filename) {
+  static const char *exts[] = {
+    ".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".wmv", ".flv",
+    ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".3gp", ".ogv"
+  };
+  size_t ln = strlen(filename);
+  for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
+    size_t el = strlen(exts[i]);
+    if (ln > el && strcasecmp(filename + ln - el, exts[i]) == 0) return true;
+  }
+  return false;
+}
+
 static bool output_already_exists(const char *movie_title, const char *lang) {
   char out[PATH_MAX];
   if (strcasecmp(lang, "en") == 0) snprintf(out, sizeof(out), "output/%s.mp4", movie_title);
@@ -2415,11 +2428,11 @@ int run_generation(void) {
 
   struct dirent *ent;
   int processed = 0;
+  int seen = 0;
   while ((ent = readdir(d))) {
     if (ent->d_name[0] == '.') continue;
-    size_t ln = strlen(ent->d_name);
-    if (ln < 4) continue;
-    if (strcasecmp(ent->d_name + ln - 4, ".mp4") != 0) continue;
+    if (!has_video_ext(ent->d_name)) continue;
+    seen++;
 
     char title[PATH_MAX];
     strip_ext(ent->d_name, title, sizeof(title));
@@ -2448,7 +2461,7 @@ int run_generation(void) {
       processed++;
       if (ok_langs + skipped_langs == cfg.recap_lang_count) {
         char retired[PATH_MAX];
-        snprintf(retired, sizeof(retired), "movies_retired/%s.mp4", title);
+        snprintf(retired, sizeof(retired), "movies_retired/%s", ent->d_name);
         rename(path, retired);
         logok("Retired source movie -> %s", retired);
       } else {
@@ -2458,6 +2471,9 @@ int run_generation(void) {
   }
 
   closedir(d);
+  if (seen == 0) {
+    logw("No video files found in movies/ (recognized: .mp4 .mkv .avi .mov .m4v .webm ...). Put the movie file directly in movies/ and re-run.");
+  }
   fprintf(stderr, "\nAll done. Processed: %d\n", processed);
 
   curl_global_cleanup();

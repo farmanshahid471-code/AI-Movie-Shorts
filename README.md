@@ -1,6 +1,6 @@
 # AI-Movie-Shorts
 
-Turn full-length `.mp4` movies into **AI-narrated movie recap videos** (horizontal + vertical), built automatically from subtitles + optional script context.
+Turn full-length movies (`.mp4`, `.mkv`, and other common video formats) into **AI-narrated movie recap videos** (horizontal + vertical), built automatically from subtitles + optional script context.
 
 Example Video: [Citizen Kane (1941)](https://www.youtube.com/watch?v=ej8c0NwKW00&t=5s)
 
@@ -53,7 +53,7 @@ Make sure that file exists, and that you run the program with the working direct
 
 ## Folder structure
 
-- `movies/` — input `.mp4` files (filename should be the movie title)
+- `movies/` — input movie files: `.mp4`, `.mkv`, `.avi`, `.mov`, `.m4v`, `.webm` and other common formats (filename should be the movie title)
 - `movies_retired/` — optional storage for movies you don’t want in the active input folder
 - `output/` — final horizontal recap videos
 - `tiktok_output/` — final vertical recap videos
@@ -360,7 +360,7 @@ Saved to `tiktok_output/`.
 
 ## Notes & troubleshooting
 
-- **Filename matters**: `movies/My Movie.mp4` → treated as title `My Movie`
+- **Filename matters**: `movies/My Movie.mkv` (or `.mp4`, ...) → treated as title `My Movie`
 - If the log is flooded with `Error splitting the input into NAL units` / `No start code is found`, the **movie file itself is damaged or incomplete** (bad download/rip). Verify it plays, or replace it — clips cut from broken sections will fail or look glitchy. Quick check:
   ```bash
   ffmpeg -v error -i "movies_retired/My Movie.mp4" -f null - | head
