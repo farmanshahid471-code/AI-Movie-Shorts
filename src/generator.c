@@ -1377,6 +1377,9 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "  {\"clips\":[{\"start\":120,\"end\":145,\"narration\":\"...\"}, ...]}\n"
     "- Clips must be increasing by start time.\n"
     "- Each narration must be at least 3 full sentences, casual commentator vibe.\n"
+    "- NARRATION STYLE: you are a movie-recap commentator. Describe and comment on what happens\n"
+    "  in each range; NEVER read or quote the subtitle/dialogue text verbatim, and never write character speech.\n"
+    "- INPUT B is story context only; do not copy its wording.\n"
     "- Use character names ONLY if they appear in INPUT A or INPUT B. Never invent or guess names.\n"
     "  If a name is not explicitly present, describe the character by role or appearance (e.g. \"the sheriff\", \"her older brother\").\n"
     "- Never use real actor names; talk about the characters only.\n"
@@ -1405,6 +1408,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     snprintf(url, sizeof(url), "%s/chat/completions", base);
 
     cJSON_AddStringToObject(req, "model", cfg->open_model[0] ? cfg->open_model : "gpt-5.2");
+    cJSON_AddNumberToObject(req, "max_tokens", 8192);
 
     cJSON *messages = cJSON_CreateArray();
 
@@ -1664,6 +1668,7 @@ static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int en
 
   int rc = run_cmd(
     "ffmpeg -y -hide_banner -loglevel error "
+    "-fflags +genpts+discardcorrupt -err_detect ignore_err "
     "-ss %d -to %d -i %s "
     "-i %s "
     "-filter_complex \"[0:v]setpts=PTS/%.10f[v]\" "

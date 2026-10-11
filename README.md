@@ -250,6 +250,11 @@ Saved to `tiktok_output/`.
 ## Notes & troubleshooting
 
 - **Filename matters**: `movies/My Movie.mp4` → treated as title `My Movie`
+- If the log is flooded with `Error splitting the input into NAL units` / `No start code is found`, the **movie file itself is damaged or incomplete** (bad download/rip). Verify it plays, or replace it — clips cut from broken sections will fail or look glitchy. Quick check:
+  ```bash
+  ffmpeg -v error -i "movies_retired/My Movie.mp4" -f null - | head
+  ```
+  (a healthy file prints almost nothing)
 - If you see “plan count = 0” or missing clips, check:
   - your OpenAI key
   - network connectivity
