@@ -157,6 +157,57 @@ Notes:
   ```
 - With `"tts_provider": "elevenlabs"` (or omitted), everything works exactly as before.
 
+### Changing the English voice
+
+The English narration voice is fully configurable — set it either way:
+
+```json
+{
+  "tts_provider": "edge",
+  "tts_voices": { "en": "en-US-GuyNeural" }
+}
+```
+
+or with the classic key (same effect):
+
+```json
+{
+  "tts_provider": "edge",
+  "edge_voice": "en-US-GuyNeural"
+}
+```
+
+If both are set, `tts_voices` `"en"` wins — so you can keep **all** voices in one place,
+including English:
+
+```json
+{
+  "tts_voices": {
+    "en": "en-US-GuyNeural",
+    "es": "es-MX-JorgeNeural",
+    "zh": "zh-CN-YunxiNeural",
+    "ar": "ar-SA-HamedNeural"
+  }
+}
+```
+
+Popular English voices for movie-recap style narration:
+
+| Voice | Style |
+|---|---|
+| `en-US-ChristopherNeural` | male, steady narrator (default) |
+| `en-US-GuyNeural` | male, warm & deep — very popular for movie recaps |
+| `en-US-EricNeural` | male, energetic, conversational |
+| `en-US-DavisNeural` | male, smooth & serious |
+| `en-US-AriaNeural` | female, clear & natural |
+| `en-US-JennyNeural` | female, friendly |
+| `en-US-MichelleNeural` | female, expressive |
+| `en-GB-RyanNeural` | male, British — cinematic feel |
+| `en-GB-SoniaNeural` | female, British |
+| `en-AU-WilliamNeural` | male, Australian |
+
+Full list: `edge-tts --list-voices` (or https://gist.github.com/BettyJJ/17cbaa1de96235a7f5773b8690a20462).
+
 ---
 
 ## Build
@@ -251,6 +302,8 @@ tiktok_output/My Movie_vertical.mp4   My Movie_es_vertical.mp4  ...
 ```
 
 Notes:
+- Any language code works — set its voice in `tts_voices`, including `"en"` for the
+  English recap (see *Changing the English voice* above).
 - Language codes follow YouTube's biggest audiences. Pre-wired with popular-market
   voices/variants: `es` = Latin American Spanish, `zh` = Simplified Chinese (Mandarin),
   `ar` = Modern Standard Arabic, plus `pt` (Brazilian), `hi`, `id`, `ja`, `ko`, `fr`,
