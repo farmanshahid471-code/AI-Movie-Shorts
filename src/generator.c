@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -186,6 +187,57 @@ static void ensure_dir(const char *p) {
   }
 }
 
+/* Windows Notepad "Unicode" (UTF-16) files would otherwise load as 1-3 bytes
+   of garbage (strlen stops at the first embedded NUL). Detect a UTF-16 BOM and
+   convert to UTF-8; strip a UTF-8 BOM. Plain UTF-8/ANSI buffers pass through. */
+static char *text_normalize_encoding(char *buf, size_t n) {
+  const unsigned char *u = (const unsigned char *)buf;
+  bool le = (n >= 2 && u[0] == 0xFF && u[1] == 0xFE);
+  bool be = (n >= 2 && u[0] == 0xFE && u[1] == 0xFF);
+  if (le || be) {
+    size_t units = (n - 2) / 2;
+    char *out = (char *)malloc(units * 3 + 4);
+    if (!out) die("OOM");
+    size_t o = 0, i = 2;
+    while (i + 1 < n) {
+      unsigned int cp = le ? ((unsigned int)u[i] | ((unsigned int)u[i + 1] << 8))
+                           : (((unsigned int)u[i] << 8) | (unsigned int)u[i + 1]);
+      i += 2;
+      if (cp == 0) continue;   /* padding NULs */
+      if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < n) {
+        unsigned int lo = le ? ((unsigned int)u[i] | ((unsigned int)u[i + 1] << 8))
+                             : (((unsigned int)u[i] << 8) | (unsigned int)u[i + 1]);
+        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+          i += 2;
+        }
+      }
+      if (cp < 0x80) {
+        out[o++] = (char)cp;
+      } else if (cp < 0x800) {
+        out[o++] = (char)(0xC0 | (cp >> 6));
+        out[o++] = (char)(0x80 | (cp & 0x3F));
+      } else if (cp < 0x10000) {
+        out[o++] = (char)(0xE0 | (cp >> 12));
+        out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[o++] = (char)(0x80 | (cp & 0x3F));
+      } else {
+        out[o++] = (char)(0xF0 | (cp >> 18));
+        out[o++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[o++] = (char)(0x80 | (cp & 0x3F));
+      }
+    }
+    out[o] = 0;
+    free(buf);
+    return out;
+  }
+  if (n >= 3 && u[0] == 0xEF && u[1] == 0xBB && u[2] == 0xBF) {
+    memmove(buf, buf + 3, n - 3 + 1);
+  }
+  return buf;
+}
+
 static char *read_entire_file(const char *path) {
   FILE *f = fopen(path, "rb");
   if (!f) return NULL;
@@ -203,7 +255,7 @@ static char *read_entire_file(const char *path) {
   }
   fclose(f);
   buf[n] = '\0';
-  return buf;
+  return text_normalize_encoding(buf, (size_t)n);
 }
 
 static bool write_entire_file(const char *path, const void *data, size_t len) {
@@ -1459,12 +1511,6 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "  {\"clips\":[{\"start\":120,\"end\":145,\"narration\":\"...\"}, ...]}\n"
     "- Clips must be increasing by start time.\n"
     "- Each narration must be at least 3 full sentences, casual commentator vibe.\n"
-    "- NARRATION STYLE: you are a movie-recap commentator. Describe and comment on what happens\n"
-    "  in each range; NEVER read or quote the subtitle/dialogue text verbatim, and never write character speech.\n"
-    "- INPUT B is story context only; do not copy its wording.\n"
-    "- Use character names ONLY if they appear in INPUT A or INPUT B. Never invent or guess names.\n"
-    "  If a name is not explicitly present, describe the character by role or appearance (e.g. \"the sheriff\", \"her older brother\").\n"
-    "- Never use real actor names; talk about the characters only.\n"
     "- The first narration must start with: \"Here we go, let's go over the movie %s.\".\n";
 
   int plen = snprintf(NULL, 0, prompt_fmt, title_utf8, subs_trim, scr_trim, num_clips, title_utf8);
@@ -1716,26 +1762,21 @@ static bool tts_to_mp3(const Config *cfg, const char *lang, const char *text, co
   return elevenlabs_tts_to_mp3(cfg, text, out_mp3_path);
 }
 
-/* Build a clip-local SRT from the movie SRT: cue times shifted by -start_s
-   (each clip's timeline restarts at 0). Cues outside the clip are dropped. */
-static bool parse_srt_ts(const char *s, double *out) {
-  char buf[64];
-  snprintf(buf, sizeof(buf), "%s", s);
-  for (char *p = buf; *p; p++) if (*p == '.') *p = ',';
-  int h = 0, m = 0, sec = 0, ms = 0;
-  if (sscanf(buf, "%d:%d:%d,%d", &h, &m, &sec, &ms) < 3) return false;
-  *out = (double)h * 3600.0 + (double)m * 60.0 + (double)sec + (double)ms / 1000.0;
-  return true;
+/* ---------------- burned-in NARRATION captions ---------------- */
+/* Build a caption SRT from the narration text (what the voiceover says), laid
+   out over [0, total_src_seconds] in source-video time. The subtitles filter
+   runs before setpts, so these stretch with the sped-up/slowed video exactly
+   like the narration audio does. */
+static int utf8_count(const char *s) {
+  int n = 0;
+  for (; *s; s++) if (((unsigned char)*s & 0xC0) != 0x80) n++;
+  return n;
 }
 
-static void clip_srt_write_cue(FILE *out, int *cue_no, double cs, double ce,
-                               double t0, double t1, const char *text) {
-  double ncs = cs - t0, nce = ce - t0;
-  if (nce <= 0.0 || ncs >= (t1 - t0)) return;
-  if (ncs < 0.0) ncs = 0.0;
-  if (nce > t1 - t0) nce = t1 - t0;
-  if (nce <= ncs) return;
-  int a = (int)llround(ncs * 1000.0), b = (int)llround(nce * 1000.0);
+#define MAX_CAP_CUES 64
+
+static void cap_write_cue(FILE *out, int *cue_no, double cs, double ce, const char *text) {
+  int a = (int)llround(cs * 1000.0), b = (int)llround(ce * 1000.0);
   fprintf(out, "%d\n%02d:%02d:%02d,%03d --> %02d:%02d:%02d,%03d\n%s\n\n",
           ++(*cue_no),
           a / 3600000, (a / 60000) % 60, (a / 1000) % 60, a % 1000,
@@ -1743,57 +1784,109 @@ static void clip_srt_write_cue(FILE *out, int *cue_no, double cs, double ce,
           text);
 }
 
-static bool write_clip_srt(const char *src_srt, int start_s, int end_s, const char *out_srt) {
-  FILE *in = fopen(src_srt, "rb");
-  if (!in) return false;
-  FILE *out = fopen(out_srt, "wb");
-  if (!out) { fclose(in); return false; }
+static bool write_narration_srt(const char *narration, double total_src_seconds, const char *out_srt) {
+  if (!narration || !narration[0] || total_src_seconds <= 0.1) return false;
 
-  double t0 = (double)start_s, t1 = (double)end_s;
-  char line[8192], text[8192];
-  double cs = 0, ce = 0;
-  int cue_no = 0;
-  bool in_cue = false;
-  text[0] = 0;
+  /* 1. Split narration into sentence-like cues. */
+  char cues[MAX_CAP_CUES][512];
+  int ncues = 0;
+  char cur[512];
+  size_t cl = 0;
+  cur[0] = 0;
 
-  while (fgets(line, sizeof(line), in)) {
-    size_t L = strlen(line);
-    while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
-
-    char a[64], b[64];
-    if (sscanf(line, "%63s --> %63s", a, b) == 2 && strchr(a, ':') && strchr(b, ':')) {
-      if (in_cue) clip_srt_write_cue(out, &cue_no, cs, ce, t0, t1, text);
-      double na = 0, nb = 0;
-      if (parse_srt_ts(a, &na) && parse_srt_ts(b, &nb)) {
-        cs = na; ce = nb; in_cue = true; text[0] = 0;
-      } else {
-        in_cue = false;
-      }
+  const char *p = narration;
+  bool need_space = false;
+  while (*p && ncues < MAX_CAP_CUES) {
+    if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+      if (cl > 0) need_space = true;
+      p++;
       continue;
     }
-    if (in_cue) {
-      if (line[0] == 0) {
-        clip_srt_write_cue(out, &cue_no, cs, ce, t0, t1, text);
-        in_cue = false;
-      } else {
-        size_t tl = strlen(text), ll = strlen(line);
-        if (tl + ll + 2 < sizeof(text)) {
-          if (tl) { text[tl++] = '\n'; text[tl] = 0; }
-          memcpy(text + tl, line, ll + 1);
-        }
-      }
+    size_t adv = 1;
+    unsigned char c0 = (unsigned char)*p;
+    if (c0 >= 0xF0) adv = 4; else if (c0 >= 0xE0) adv = 3; else if (c0 >= 0xC0) adv = 2;
+    if (cl + adv + 2 >= sizeof(cur)) {
+      memcpy(cues[ncues], cur, cl + 1);
+      ncues++;
+      cl = 0; cur[0] = 0; need_space = false;
+      if (ncues >= MAX_CAP_CUES) break;
+    }
+    if (need_space && cl > 0) { cur[cl++] = ' '; cur[cl] = 0; }
+    need_space = false;
+    memcpy(cur + cl, p, adv);
+    cl += adv;
+    cur[cl] = 0;
+    p += adv;
+
+    /* sentence end (ASCII or CJK punctuation) or very long cue → flush */
+    bool sentence_end = false;
+    unsigned char last = (unsigned char)cur[cl - 1];
+    if (last == '.' || last == '!' || last == '?' || last == ':' || last == ';') sentence_end = true;
+    if (adv == 3 && cl >= 3) {   /* CJK terminators: 。 ！ ？ … */
+      const char *lt = cur + cl - 3;
+      if (memcmp(lt, "\xE3\x80\x82", 3) == 0 ||
+          memcmp(lt, "\xEF\xBC\x81", 3) == 0 ||
+          memcmp(lt, "\xEF\xBC\x9F", 3) == 0 ||
+          memcmp(lt, "\xE2\x80\xA6", 3) == 0)
+        sentence_end = true;
+    }
+    if (sentence_end || utf8_count(cur) >= 40) {
+      memcpy(cues[ncues], cur, cl + 1);
+      ncues++;
+      cl = 0; cur[0] = 0;
     }
   }
-  if (in_cue) clip_srt_write_cue(out, &cue_no, cs, ce, t0, t1, text);
+  if (cl > 0 && ncues < MAX_CAP_CUES) {
+    memcpy(cues[ncues], cur, cl + 1);
+    ncues++;
+  }
+  if (ncues == 0) return false;
 
-  fclose(in);
+  /* 2. If more cues than the window can show, merge pairs until they fit. */
+  int max_cues = (int)(total_src_seconds / 0.8);
+  if (max_cues < 1) max_cues = 1;
+  if (max_cues > MAX_CAP_CUES) max_cues = MAX_CAP_CUES;
+  while (ncues > max_cues) {
+    int best = 0, best_len = INT_MAX;
+    for (int i = 0; i + 1 < ncues; i++) {
+      int l = utf8_count(cues[i]) + utf8_count(cues[i + 1]);
+      if (l < best_len) { best_len = l; best = i; }
+    }
+    if (strlen(cues[best]) + strlen(cues[best + 1]) + 2 < sizeof(cues[0])) {
+      strcat(cues[best], " ");
+      strcat(cues[best], cues[best + 1]);
+    }
+    for (int i = best + 1; i + 1 < ncues; i++) memcpy(cues[i], cues[i + 1], sizeof(cues[0]));
+    ncues--;
+  }
+
+  /* 3. Timing: proportional to caption length, min 0.4s each. */
+  long total_w = 0;
+  for (int i = 0; i < ncues; i++) {
+    int w = utf8_count(cues[i]);
+    total_w += (w > 0 ? w : 1);
+  }
+  FILE *out = fopen(out_srt, "wb");
+  if (!out) return false;
+  int cue_no = 0;
+  double t = 0.0;
+  for (int i = 0; i < ncues; i++) {
+    int w = utf8_count(cues[i]);
+    double dur = total_src_seconds * (double)(w > 0 ? w : 1) / (double)total_w;
+    if (dur < 0.4) dur = 0.4;
+    double cs = t, ce = t + dur;
+    if (ce > total_src_seconds) ce = total_src_seconds;
+    if (i == ncues - 1) ce = total_src_seconds;
+    if (ce > cs) cap_write_cue(out, &cue_no, cs, ce, cues[i]);
+    t = ce;
+  }
   fclose(out);
   return cue_no > 0;
 }
 
 static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int end_s,
                                       const char *narration_mp3, double narration_dur,
-                                      const char *out_mp4, bool burn_subs, const char *src_srt) {
+                                      const char *out_mp4, bool burn_subs, const char *narration_text) {
   double orig_seg_dur = (double)(end_s - start_s);
   if (orig_seg_dur <= 0.1 || narration_dur <= 0.1) return false;
 
@@ -1843,11 +1936,11 @@ static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int en
   char *out_esc = sh_escape(out_mp4);
 
   char sub_filter[256] = {0};
-  if (burn_subs && src_srt && src_srt[0]) {
-    if (write_clip_srt(src_srt, use_start, use_end, "clips/_clip_subs.srt")) {
+  if (burn_subs && narration_text && narration_text[0]) {
+    if (write_narration_srt(narration_text, (double)(use_end - use_start), "clips/_clip_subs.srt")) {
       snprintf(sub_filter, sizeof(sub_filter), "subtitles=filename='clips/_clip_subs.srt',");
     } else {
-      logw("Subtitle burn: no cues in range for %s (clip continues without subs).", out_mp4);
+      logw("Subtitle burn: could not build narration captions for %s (clip continues without subs).", out_mp4);
     }
   }
 
@@ -2240,7 +2333,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
 
     logi("Building clip %zu: %d -> %d sec (narr=%.2fs) => %s", i + 1, start_s, end_s, nar_dur, out_clip);
     if (!ffmpeg_make_adjusted_clip(movie_path, start_s, end_s, nar_mp3, nar_dur, out_clip,
-                                   cfg->burn_subtitles, srt_in)) {
+                                   cfg->burn_subtitles, plan.items[i].narration)) {
       logw("Failed to build adjusted clip %zu", i + 1);
       continue;
     }

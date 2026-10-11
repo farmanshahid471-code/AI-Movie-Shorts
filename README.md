@@ -324,9 +324,11 @@ Notes:
 
 ## Burned-in subtitles
 
-Add `"burn_subtitles": true` to `config.json` to hard-code subtitles into the recap
-videos. Each clip shows the subtitle lines for its own time range (properly synced to
-the cut/speed-adjusted clip), from the SRT of that recap's language.
+Add `"burn_subtitles": true` to `config.json` to hard-code captions into the recap
+videos. The burned-in text is the **narration script** — the same words the voiceover
+speaks (in that recap's language) — split into short caption lines and synced to each
+clip. (The movie's own dialogue subtitles are only used as planning input; they are
+not burned into the video.)
 
 ---
 
@@ -340,8 +342,8 @@ You can provide your own files instead — just drop them in `scripts/srt_files/
 - **Subtitles**: `scripts/srt_files/<MovieTitle>.srt` (any normal SRT file)
 - **Transcript / script context**: `scripts/srt_files/<MovieTitle>_summary.txt`
   - Any plain text (screenplay, transcript, plot summary) — must be at least 200 bytes.
-  - Used as extra story context for the LLM.
-  - Greatly improves **character-name accuracy**: the narrator only uses names that appear in your subtitles/transcript, and refers to unnamed characters by role (e.g. “the sheriff”) instead of inventing names.
+  - Used as extra story context for the LLM (improves plot flow and narration/visual pairing).
+  - Save it as UTF-8 or ANSI (UTF-16 files, e.g. Notepad “Unicode”, are converted automatically).
 
 Then rerun.
 
