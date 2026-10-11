@@ -253,6 +253,11 @@ If `backgroundmusic/` contains `.mp3` or `.m4a` files, the program will:
 
 If no music files exist, output will be narration-only.
 
+**To turn background music OFF:** empty the `backgroundmusic/` folder — move its
+`.mp3` / `.m4a` files somewhere else (or delete them). The program logs
+`No backgroundmusic files found; output will be narration-only` and skips music
+entirely. To turn music back on later, put the files back.
+
 ---
 
 ## Recap length
