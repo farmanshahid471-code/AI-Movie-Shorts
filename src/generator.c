@@ -260,7 +260,11 @@ static MemBuf http_get_to_mem_ex(const char *url, long *http_code_out) {
 
   if (res != CURLE_OK) {
     if (buf.data) free(buf.data);
-    die("GET failed: %s (%s)", url, curl_easy_strerror(res));
+    logw("GET failed: %s (%s)", url, curl_easy_strerror(res));
+    if (res == CURLE_SSL_CACERT_BADFILE || res == CURLE_PEER_FAILED_VERIFICATION) {
+      logw("SSL certificate problem. Install CA certs (pacman -S mingw-w64-x86_64-ca-certificates) or set SSL_CERT_FILE to a valid cacert.pem.");
+    }
+    return (MemBuf){0};
   }
 
   return buf;
@@ -308,7 +312,11 @@ static MemBuf http_post_json_to_mem(const char *url, const char *bearer_key, con
 
   if (res != CURLE_OK) {
     if (buf.data) free(buf.data);
-    die("POST failed: %s", curl_easy_strerror(res));
+    logw("POST failed: %s", curl_easy_strerror(res));
+    if (res == CURLE_SSL_CACERT_BADFILE || res == CURLE_PEER_FAILED_VERIFICATION) {
+      logw("SSL certificate problem. Install CA certs (pacman -S mingw-w64-x86_64-ca-certificates) or set SSL_CERT_FILE to a valid cacert.pem.");
+    }
+    return (MemBuf){0};
   }
 
   return buf;
