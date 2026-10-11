@@ -457,6 +457,11 @@ typedef struct {
   char edge_voice[128];      /* Edge TTS voice, e.g. en-US-ChristopherNeural */
   int  min_clips;            /* recap length knobs (defaults: 20 / 30) */
   int  max_clips;
+  /* multi-language recap (default: English only, behavior unchanged) */
+  char recap_languages[8][16];
+  int  recap_lang_count;
+  char tts_voices[8][128];   /* per-language TTS voice, aligned with recap_languages ("" = default) */
+  bool burn_subtitles;
 } Config;
 
 static Config load_config_json(const char *path) {
@@ -524,6 +529,40 @@ static Config load_config_json(const char *path) {
   if (c.min_clips <= 0) c.min_clips = MIN_NUM_CLIPS;
   if (c.max_clips <= 0) c.max_clips = MAX_NUM_CLIPS;
   if (c.max_clips < c.min_clips) c.max_clips = c.min_clips;
+
+  c.recap_lang_count = 0;
+  const cJSON *langs = cJSON_GetObjectItemCaseSensitive(root, "recap_languages");
+  if (cJSON_IsArray(langs)) {
+    const cJSON *it = NULL;
+    cJSON_ArrayForEach(it, langs) {
+      if (c.recap_lang_count >= 8) break;
+      if (cJSON_IsString(it) && it->valuestring && it->valuestring[0]) {
+        strncpy(c.recap_languages[c.recap_lang_count], it->valuestring, sizeof(c.recap_languages[0]) - 1);
+        for (char *p = c.recap_languages[c.recap_lang_count]; *p; p++) *p = (char)tolower((unsigned char)*p);
+        c.recap_lang_count++;
+      }
+    }
+  }
+  if (c.recap_lang_count == 0) {
+    strncpy(c.recap_languages[0], "en", sizeof(c.recap_languages[0]) - 1);
+    c.recap_lang_count = 1;
+  }
+
+  c.burn_subtitles = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "burn_subtitles"));
+
+  const cJSON *tv = cJSON_GetObjectItemCaseSensitive(root, "tts_voices");
+  if (cJSON_IsObject(tv)) {
+    const cJSON *kv = NULL;
+    cJSON_ArrayForEach(kv, tv) {
+      if (!kv->string || !cJSON_IsString(kv) || !kv->valuestring) continue;
+      for (int i = 0; i < c.recap_lang_count; i++) {
+        if (strcasecmp(c.recap_languages[i], kv->string) == 0) {
+          strncpy(c.tts_voices[i], kv->valuestring, sizeof(c.tts_voices[0]) - 1);
+          break;
+        }
+      }
+    }
+  }
 
   cJSON_Delete(root);
   return c;
@@ -1335,12 +1374,55 @@ static char *trim_copy_utf8_safe(const char *s, size_t max_bytes) {
   return out;
 }
 
+/* ----------------------- Recap languages ----------------------- */
+
+static const char *lang_display_name(const char *code) {
+  static const struct { const char *code; const char *name; } m[] = {
+    {"en","English"}, {"es","Latin American Spanish"}, {"zh","Simplified Chinese (Mandarin)"},
+    {"ar","Modern Standard Arabic"}, {"pt","Brazilian Portuguese"}, {"hi","Hindi"},
+    {"id","Indonesian"}, {"ja","Japanese"}, {"ko","Korean"}, {"fr","French"},
+    {"de","German"}, {"tr","Turkish"}, {"ru","Russian"}, {"vi","Vietnamese"},
+    {"th","Thai"}, {"it","Italian"}, {"fil","Filipino"}, {"fa","Persian"}, {"ur","Urdu"},
+  };
+  for (size_t i = 0; i < sizeof(m) / sizeof(m[0]); i++)
+    if (strcasecmp(m[i].code, code) == 0) return m[i].name;
+  return code;
+}
+
+static const char *lang_default_voice(const char *code) {
+  /* Popular YouTube-market Edge TTS voices (LatAm Spanish, Simplified Chinese, MSA Arabic, ...) */
+  static const struct { const char *code; const char *voice; } m[] = {
+    {"en","en-US-ChristopherNeural"}, {"es","es-MX-JorgeNeural"}, {"zh","zh-CN-YunxiNeural"},
+    {"ar","ar-SA-HamedNeural"}, {"pt","pt-BR-AntonioNeural"}, {"hi","hi-IN-MadhurNeural"},
+    {"id","id-ID-ArdiNeural"}, {"ja","ja-JP-KeitaNeural"}, {"ko","ko-KR-InJoonNeural"},
+    {"fr","fr-FR-HenriNeural"}, {"de","de-DE-ConradNeural"}, {"tr","tr-TR-AhmetNeural"},
+    {"ru","ru-RU-DmitryNeural"}, {"vi","vi-VN-NamMinhNeural"}, {"th","th-TH-NiwatNeural"},
+    {"it","it-IT-DiegoNeural"}, {"fil","fil-PH-BlessieNeural"}, {"fa","fa-IR-DilaraNeural"},
+    {"ur","ur-PK-UzmaNeural"},
+  };
+  for (size_t i = 0; i < sizeof(m) / sizeof(m[0]); i++)
+    if (strcasecmp(m[i].code, code) == 0) return m[i].voice;
+  return "";
+}
+
+static const char *voice_for_lang(const Config *cfg, const char *lang) {
+  for (int i = 0; i < cfg->recap_lang_count; i++) {
+    if (strcasecmp(cfg->recap_languages[i], lang) == 0 && cfg->tts_voices[i][0]) {
+      return cfg->tts_voices[i];
+    }
+  }
+  if (strcasecmp(lang, "en") == 0) return cfg->edge_voice;
+  const char *def = lang_default_voice(lang);
+  return def[0] ? def : cfg->edge_voice;
+}
+
 static ClipPlanList openai_make_plan(const Config *cfg,
                                      const char *movie_title,
                                      const char *subs_seconds_text,
                                      const char *optional_script_text,
                                      int num_clips,
-                                     bool *out_retry_without_script) {
+                                     bool *out_retry_without_script,
+                                     const char *lang_code) {
   if (out_retry_without_script) *out_retry_without_script = false;
 
   const size_t MAX_SUB_CHARS    = 320000;
@@ -1394,6 +1476,25 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   free(title_utf8);
   free(subs_trim);
   free(scr_trim);
+
+  if (lang_code && lang_code[0] && strcasecmp(lang_code, "en") != 0) {
+    const char *lname = lang_display_name(lang_code);
+    char appendix[1600];
+    snprintf(appendix, sizeof(appendix),
+             "\nLANGUAGE REQUIREMENT (changes ONLY the language of the narration, not any rule above):\n"
+             "- Write EVERY narration in natural %s (spoken style, like top YouTube recap channels).\n"
+             "- The first narration must start with a sentence in %s that means: "
+             "\"Here we go, let's go over the movie %s.\".\n"
+             "- Keep character names as commonly written in %s.\n",
+             lname, lname, movie_title ? movie_title : "", lname);
+    size_t n1 = strlen(prompt), n2 = strlen(appendix);
+    char *full = (char *)malloc(n1 + n2 + 1);
+    if (!full) die("OOM");
+    memcpy(full, prompt, n1);
+    memcpy(full + n1, appendix, n2 + 1);
+    free(prompt);
+    prompt = full;
+  }
 
   cJSON *req = cJSON_CreateObject();
   char url[1200];
@@ -1580,7 +1681,7 @@ static bool edge_tts_try_tool(const char *tool, const char *txt_esc, const char 
   return ok;
 }
 
-static bool edge_tts_to_mp3(const Config *cfg, const char *text, const char *out_mp3_path) {
+static bool edge_tts_to_mp3(const char *voice, const char *text, const char *out_mp3_path) {
   char tmp_txt[PATH_MAX];
   snprintf(tmp_txt, sizeof(tmp_txt), "%s.txt", out_mp3_path);
 
@@ -1590,7 +1691,7 @@ static bool edge_tts_to_mp3(const Config *cfg, const char *text, const char *out
   }
 
   char *txt_esc   = sh_escape(tmp_txt);
-  char *voice_esc = sh_escape(cfg->edge_voice);
+  char *voice_esc = sh_escape(voice && voice[0] ? voice : "en-US-ChristopherNeural");
   char *out_esc   = sh_escape(out_mp3_path);
 
   bool ok = edge_tts_try_tool("edge-tts", txt_esc, voice_esc, out_esc, out_mp3_path);
@@ -1608,16 +1709,91 @@ static bool edge_tts_to_mp3(const Config *cfg, const char *text, const char *out
   return ok;
 }
 
-static bool tts_to_mp3(const Config *cfg, const char *text, const char *out_mp3_path) {
+static bool tts_to_mp3(const Config *cfg, const char *lang, const char *text, const char *out_mp3_path) {
   if (strcasecmp(cfg->tts_provider, "edge") == 0) {
-    return edge_tts_to_mp3(cfg, text, out_mp3_path);
+    return edge_tts_to_mp3(voice_for_lang(cfg, lang), text, out_mp3_path);
   }
   return elevenlabs_tts_to_mp3(cfg, text, out_mp3_path);
 }
 
+/* Build a clip-local SRT from the movie SRT: cue times shifted by -start_s
+   (each clip's timeline restarts at 0). Cues outside the clip are dropped. */
+static bool parse_srt_ts(const char *s, double *out) {
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%s", s);
+  for (char *p = buf; *p; p++) if (*p == '.') *p = ',';
+  int h = 0, m = 0, sec = 0, ms = 0;
+  if (sscanf(buf, "%d:%d:%d,%d", &h, &m, &sec, &ms) < 3) return false;
+  *out = (double)h * 3600.0 + (double)m * 60.0 + (double)sec + (double)ms / 1000.0;
+  return true;
+}
+
+static void clip_srt_write_cue(FILE *out, int *cue_no, double cs, double ce,
+                               double t0, double t1, const char *text) {
+  double ncs = cs - t0, nce = ce - t0;
+  if (nce <= 0.0 || ncs >= (t1 - t0)) return;
+  if (ncs < 0.0) ncs = 0.0;
+  if (nce > t1 - t0) nce = t1 - t0;
+  if (nce <= ncs) return;
+  int a = (int)llround(ncs * 1000.0), b = (int)llround(nce * 1000.0);
+  fprintf(out, "%d\n%02d:%02d:%02d,%03d --> %02d:%02d:%02d,%03d\n%s\n\n",
+          ++(*cue_no),
+          a / 3600000, (a / 60000) % 60, (a / 1000) % 60, a % 1000,
+          b / 3600000, (b / 60000) % 60, (b / 1000) % 60, b % 1000,
+          text);
+}
+
+static bool write_clip_srt(const char *src_srt, int start_s, int end_s, const char *out_srt) {
+  FILE *in = fopen(src_srt, "rb");
+  if (!in) return false;
+  FILE *out = fopen(out_srt, "wb");
+  if (!out) { fclose(in); return false; }
+
+  double t0 = (double)start_s, t1 = (double)end_s;
+  char line[8192], text[8192];
+  double cs = 0, ce = 0;
+  int cue_no = 0;
+  bool in_cue = false;
+  text[0] = 0;
+
+  while (fgets(line, sizeof(line), in)) {
+    size_t L = strlen(line);
+    while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
+
+    char a[64], b[64];
+    if (sscanf(line, "%63s --> %63s", a, b) == 2 && strchr(a, ':') && strchr(b, ':')) {
+      if (in_cue) clip_srt_write_cue(out, &cue_no, cs, ce, t0, t1, text);
+      double na = 0, nb = 0;
+      if (parse_srt_ts(a, &na) && parse_srt_ts(b, &nb)) {
+        cs = na; ce = nb; in_cue = true; text[0] = 0;
+      } else {
+        in_cue = false;
+      }
+      continue;
+    }
+    if (in_cue) {
+      if (line[0] == 0) {
+        clip_srt_write_cue(out, &cue_no, cs, ce, t0, t1, text);
+        in_cue = false;
+      } else {
+        size_t tl = strlen(text), ll = strlen(line);
+        if (tl + ll + 2 < sizeof(text)) {
+          if (tl) { text[tl++] = '\n'; text[tl] = 0; }
+          memcpy(text + tl, line, ll + 1);
+        }
+      }
+    }
+  }
+  if (in_cue) clip_srt_write_cue(out, &cue_no, cs, ce, t0, t1, text);
+
+  fclose(in);
+  fclose(out);
+  return cue_no > 0;
+}
+
 static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int end_s,
                                       const char *narration_mp3, double narration_dur,
-                                      const char *out_mp4) {
+                                      const char *out_mp4, bool burn_subs, const char *src_srt) {
   double orig_seg_dur = (double)(end_s - start_s);
   if (orig_seg_dur <= 0.1 || narration_dur <= 0.1) return false;
 
@@ -1666,17 +1842,26 @@ static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int en
   char *nar_esc = sh_escape(narration_mp3);
   char *out_esc = sh_escape(out_mp4);
 
+  char sub_filter[256] = {0};
+  if (burn_subs && src_srt && src_srt[0]) {
+    if (write_clip_srt(src_srt, use_start, use_end, "clips/_clip_subs.srt")) {
+      snprintf(sub_filter, sizeof(sub_filter), "subtitles=filename='clips/_clip_subs.srt',");
+    } else {
+      logw("Subtitle burn: no cues in range for %s (clip continues without subs).", out_mp4);
+    }
+  }
+
   int rc = run_cmd(
     "ffmpeg -y -hide_banner -loglevel error "
     "-fflags +genpts+discardcorrupt -err_detect ignore_err "
     "-ss %d -to %d -i %s "
     "-i %s "
-    "-filter_complex \"[0:v]setpts=PTS/%.10f[v]\" "
+    "-filter_complex \"[0:v]%ssetpts=PTS/%.10f[v]\" "
     "-map \"[v]\" -map 1:a "
     "-c:v libx264 -pix_fmt yuv420p -preset veryfast -crf 22 "
     "-c:a aac -b:a 192k "
     "-shortest %s",
-    use_start, use_end, in_esc, nar_esc, speed, out_esc
+    use_start, use_end, in_esc, nar_esc, sub_filter, speed, out_esc
   );
 
   free(in_esc);
@@ -1911,7 +2096,7 @@ static bool clear_directory_contents(const char *dir_path) {
 /* ----------------------- Movie pipeline ----------------------- */
 
 static bool process_movie(const Config *cfg, const char *movie_path, const char *movie_title,
-                          int num_clips) {
+                          int num_clips, const char *lang) {
   ensure_dir("clips");
   ensure_dir("clips/audio");
   ensure_dir("output");
@@ -1920,12 +2105,21 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   ensure_dir("scripts/srt_files");
   ensure_dir("movies_retired");
 
+  const bool is_en = (strcasecmp(lang, "en") == 0);
+  char tag[32], lang_dot[32];
+  if (is_en) { tag[0] = 0; lang_dot[0] = 0; }
+  else { snprintf(tag, sizeof(tag), "_%s", lang); snprintf(lang_dot, sizeof(lang_dot), ".%s", lang); }
+
   char srt_in[PATH_MAX], srt_mod[PATH_MAX], script_txt[PATH_MAX];
-  snprintf(srt_in, sizeof(srt_in), "scripts/srt_files/%s.srt", movie_title);
-  snprintf(srt_mod, sizeof(srt_mod), "scripts/srt_files/%s_modified.srt", movie_title);
+  snprintf(srt_in, sizeof(srt_in), "scripts/srt_files/%s%s.srt", movie_title, lang_dot);
+  snprintf(srt_mod, sizeof(srt_mod), "scripts/srt_files/%s%s_modified.srt", movie_title, lang_dot);
   snprintf(script_txt, sizeof(script_txt), "scripts/srt_files/%s_summary.txt", movie_title);
 
   if (!file_exists(srt_in)) {
+    if (!is_en) {
+      logw("No %s subtitles for %s. Provide them at: %s", lang, movie_title, srt_in);
+      return false;
+    }
     logi("No SRT found for %s; attempting download...", movie_title);
     if (!download_subtitle_srt(movie_title, srt_in)) {
       logw("Subtitle download failed for %s. Place your SRT at: %s", movie_title, srt_in);
@@ -1985,15 +2179,15 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     logi("No script/transcript available; using subtitles only.");
   }
 
-  logi("Requesting LLM clip plan (%d clips target)...", num_clips);
+  logi("Requesting LLM clip plan (%d clips target, lang=%s)...", num_clips, lang);
   bool retry_no_script = false;
   ClipPlanList plan = openai_make_plan(cfg, movie_title, subs_seconds,
                                        imsdb_script ? imsdb_script : "",
-                                       num_clips, &retry_no_script);
+                                       num_clips, &retry_no_script, lang);
 
   if (plan.count == 0 && retry_no_script && imsdb_script && imsdb_script[0]) {
     logw("LLM request failed with script context; retrying without it for %s", movie_title);
-    plan = openai_make_plan(cfg, movie_title, subs_seconds, "", num_clips, NULL);
+    plan = openai_make_plan(cfg, movie_title, subs_seconds, "", num_clips, NULL, lang);
   }
 
   free(subs_seconds);
@@ -2007,7 +2201,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   logok("LLM plan received: %zu clips", plan.count);
 
   char concat_list_path[PATH_MAX];
-  snprintf(concat_list_path, sizeof(concat_list_path), "clips/%s_concat_list.txt", movie_title);
+  snprintf(concat_list_path, sizeof(concat_list_path), "clips/%s%s_concat_list.txt", movie_title, tag);
 
   FILE *listf = fopen(concat_list_path, "wb");
   if (!listf) {
@@ -2024,10 +2218,10 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     if (end_s <= start_s) { logw("Skipping clip %zu (end<=start)", i + 1); continue; }
 
     char nar_mp3[PATH_MAX];
-    snprintf(nar_mp3, sizeof(nar_mp3), "clips/audio/%s_audio_%zu.mp3", movie_title, i + 1);
+    snprintf(nar_mp3, sizeof(nar_mp3), "clips/audio/%s%s_audio_%zu.mp3", movie_title, tag, i + 1);
 
     logi("TTS clip %zu/%zu -> %s", i + 1, plan.count, nar_mp3);
-    if (!tts_to_mp3(cfg, plan.items[i].narration, nar_mp3)) {
+    if (!tts_to_mp3(cfg, lang, plan.items[i].narration, nar_mp3)) {
       logw("TTS failed clip %zu for %s", i + 1, movie_title);
       continue;
     }
@@ -2039,13 +2233,14 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     }
 
     char out_clip_name[PATH_MAX];
-    snprintf(out_clip_name, sizeof(out_clip_name), "%s_clip_%zu.mp4", movie_title, i + 1);
+    snprintf(out_clip_name, sizeof(out_clip_name), "%s%s_clip_%zu.mp4", movie_title, tag, i + 1);
 
     char out_clip[PATH_MAX];
     snprintf(out_clip, sizeof(out_clip), "clips/%s", out_clip_name);
 
     logi("Building clip %zu: %d -> %d sec (narr=%.2fs) => %s", i + 1, start_s, end_s, nar_dur, out_clip);
-    if (!ffmpeg_make_adjusted_clip(movie_path, start_s, end_s, nar_mp3, nar_dur, out_clip)) {
+    if (!ffmpeg_make_adjusted_clip(movie_path, start_s, end_s, nar_mp3, nar_dur, out_clip,
+                                   cfg->burn_subtitles, srt_in)) {
       logw("Failed to build adjusted clip %zu", i + 1);
       continue;
     }
@@ -2065,7 +2260,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   logok("Clips produced: %zu (concat list: %s)", made, concat_list_path);
 
   char tmp_concat[PATH_MAX];
-  snprintf(tmp_concat, sizeof(tmp_concat), "clips/%s_concat_tmp.mp4", movie_title);
+  snprintf(tmp_concat, sizeof(tmp_concat), "clips/%s%s_concat_tmp.mp4", movie_title, tag);
 
   logi("Concatenating clips -> %s", tmp_concat);
   if (!ffmpeg_concat_videos(concat_list_path, tmp_concat)) {
@@ -2086,14 +2281,14 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   if (!songs || song_n == 0) {
     logw("No backgroundmusic files found; output will be narration-only.");
     char out_final_only[PATH_MAX];
-    snprintf(out_final_only, sizeof(out_final_only), "output/%s.mp4", movie_title);
+    snprintf(out_final_only, sizeof(out_final_only), "output/%s%s.mp4", movie_title, tag);
     rename(tmp_concat, out_final_only);
     logok("Wrote output (no BGM): %s", out_final_only);
   } else {
     srand((unsigned)time(NULL));
 
     char bgm_list[PATH_MAX];
-    snprintf(bgm_list, sizeof(bgm_list), "clips/%s_bgm_list.txt", movie_title);
+    snprintf(bgm_list, sizeof(bgm_list), "clips/%s%s_bgm_list.txt", movie_title, tag);
     FILE *bgml = fopen(bgm_list, "wb");
     if (!bgml) die("Failed bgm list create");
 
@@ -2114,7 +2309,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
       double take = (avail < need) ? avail : need;
 
       char part_name[PATH_MAX];
-      snprintf(part_name, sizeof(part_name), "%s_bgm_part_%d.m4a", movie_title, ++part);
+      snprintf(part_name, sizeof(part_name), "%s%s_bgm_part_%d.m4a", movie_title, tag, ++part);
 
       char part_path[PATH_MAX];
       snprintf(part_path, sizeof(part_path), "clips/%s", part_name);
@@ -2131,20 +2326,20 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     logok("BGM parts created: %d (covered %.2fs / %.2fs)", part, covered, final_dur);
 
     char bgm_out[PATH_MAX];
-    snprintf(bgm_out, sizeof(bgm_out), "clips/%s_bgm.m4a", movie_title);
+    snprintf(bgm_out, sizeof(bgm_out), "clips/%s%s_bgm.m4a", movie_title, tag);
 
     logi("Concatenating BGM -> %s", bgm_out);
     if (!ffmpeg_concat_audio(bgm_list, bgm_out)) {
       logw("BGM concat failed; output narration-only.");
       char out_final_only[PATH_MAX];
-      snprintf(out_final_only, sizeof(out_final_only), "output/%s.mp4", movie_title);
+      snprintf(out_final_only, sizeof(out_final_only), "output/%s%s.mp4", movie_title, tag);
       rename(tmp_concat, out_final_only);
       logok("Wrote output (no BGM): %s", out_final_only);
     } else {
       logok("BGM concat OK: %s", bgm_out);
 
       char out_final_only[PATH_MAX];
-      snprintf(out_final_only, sizeof(out_final_only), "output/%s.mp4", movie_title);
+      snprintf(out_final_only, sizeof(out_final_only), "output/%s%s.mp4", movie_title, tag);
 
       logi("Mixing narration + BGM -> %s", out_final_only);
       if (!ffmpeg_mix_bgm(tmp_concat, bgm_out, out_final_only)) {
@@ -2160,8 +2355,8 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   }
 
   char out_final[PATH_MAX], out_vert[PATH_MAX];
-  snprintf(out_final, sizeof(out_final), "output/%s.mp4", movie_title);
-  snprintf(out_vert,  sizeof(out_vert),  "tiktok_output/%s_vertical.mp4", movie_title);
+  snprintf(out_final, sizeof(out_final), "output/%s%s.mp4", movie_title, tag);
+  snprintf(out_vert,  sizeof(out_vert),  "tiktok_output/%s%s_vertical.mp4", movie_title, tag);
 
   logi("Rendering vertical -> %s", out_vert);
   if (!ffmpeg_make_vertical(out_final, out_vert)) {
@@ -2170,17 +2365,13 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     logok("Vertical render OK: %s", out_vert);
   }
 
-  char retired[PATH_MAX];
-  snprintf(retired, sizeof(retired), "movies_retired/%s.mp4", movie_title);
-  rename(movie_path, retired);
-  logok("Retired source movie -> %s", retired);
-
   return true;
 }
 
-static bool output_already_exists(const char *movie_title) {
+static bool output_already_exists(const char *movie_title, const char *lang) {
   char out[PATH_MAX];
-  snprintf(out, sizeof(out), "output/%s.mp4", movie_title);
+  if (strcasecmp(lang, "en") == 0) snprintf(out, sizeof(out), "output/%s.mp4", movie_title);
+  else snprintf(out, sizeof(out), "output/%s_%s.mp4", movie_title, lang);
   return file_exists(out);
 }
 
@@ -2233,20 +2424,36 @@ int run_generation(void) {
     char title[PATH_MAX];
     strip_ext(ent->d_name, title, sizeof(title));
 
-    if (output_already_exists(title)) {
-      logi("Skipping %s (already in output/)", title);
-      continue;
-    }
-
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "movies/%s", ent->d_name);
 
-    fprintf(stderr, "\n=== Processing: %s ===\n", title);
-    if (process_movie(&cfg, path, title, num_clips)) {
+    int ok_langs = 0, skipped_langs = 0;
+    for (int li = 0; li < cfg.recap_lang_count; li++) {
+      const char *lang = cfg.recap_languages[li];
+      if (output_already_exists(title, lang)) {
+        logi("Skipping %s [%s] (already in output/)", title, lang);
+        skipped_langs++;
+        continue;
+      }
+      fprintf(stderr, "\n=== Processing: %s (%s) ===\n", title, lang);
+      if (process_movie(&cfg, path, title, num_clips, lang)) {
+        ok_langs++;
+        fprintf(stderr, "DONE: %s (%s)\n", title, lang);
+      } else {
+        fprintf(stderr, "FAILED: %s (%s)\n", title, lang);
+      }
+    }
+
+    if (ok_langs > 0) {
       processed++;
-      fprintf(stderr, "DONE: %s\n", title);
-    } else {
-      fprintf(stderr, "FAILED: %s\n", title);
+      if (ok_langs + skipped_langs == cfg.recap_lang_count) {
+        char retired[PATH_MAX];
+        snprintf(retired, sizeof(retired), "movies_retired/%s.mp4", title);
+        rename(path, retired);
+        logok("Retired source movie -> %s", retired);
+      } else {
+        logw("Keeping %s in movies/ (some languages failed; rerun to retry).", title);
+      }
     }
   }
 

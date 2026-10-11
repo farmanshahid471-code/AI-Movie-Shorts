@@ -219,6 +219,59 @@ The recap lasts roughly `num_clips × 8–15 seconds` of narration. The default
 
 ---
 
+## Multiple languages (Chinese, Arabic, Spanish, ...)
+
+Generate one recap **per language, one after another**. In `config.json`:
+
+```json
+{
+  "recap_languages": ["en", "es", "zh", "ar"],
+  "tts_voices": {
+    "es": "es-MX-JorgeNeural",
+    "zh": "zh-CN-YunxiNeural",
+    "ar": "ar-SA-HamedNeural"
+  }
+}
+```
+
+Provide subtitles for each language in `scripts/srt_files/` (movie title must match):
+
+```
+scripts/srt_files/My Movie.srt       ← English (auto-downloaded if missing)
+scripts/srt_files/My Movie.es.srt    ← Spanish (you provide)
+scripts/srt_files/My Movie.zh.srt    ← Chinese (you provide)
+scripts/srt_files/My Movie.ar.srt    ← Arabic (you provide)
+```
+
+Outputs (one per language):
+
+```
+output/My Movie.mp4        output/My Movie_es.mp4      output/My Movie_zh.mp4  ...
+tiktok_output/My Movie_vertical.mp4   My Movie_es_vertical.mp4  ...
+```
+
+Notes:
+- Language codes follow YouTube's biggest audiences. Pre-wired with popular-market
+  voices/variants: `es` = Latin American Spanish, `zh` = Simplified Chinese (Mandarin),
+  `ar` = Modern Standard Arabic, plus `pt` (Brazilian), `hi`, `id`, `ja`, `ko`, `fr`,
+  `de`, `tr`, `ru`, `vi`, `th`, `it`, `fil`, `fa`, `ur`. Any code works — set its voice
+  in `tts_voices`.
+- Narration is written **directly in that language** by the LLM. All the existing
+  planning/narration rules are unchanged — only the output language changes.
+- The `<Title>_summary.txt` transcript is shared across all languages (story context).
+- The source movie is moved to `movies_retired/` only when **all** requested languages
+  succeed (failed languages can be retried by re-running).
+
+---
+
+## Burned-in subtitles
+
+Add `"burn_subtitles": true` to `config.json` to hard-code subtitles into the recap
+videos. Each clip shows the subtitle lines for its own time range (properly synced to
+the cut/speed-adjusted clip), from the SRT of that recap's language.
+
+---
+
 ## Subtitles / script fetching
 
 - Subtitles (SRT) are auto-downloaded when missing.
