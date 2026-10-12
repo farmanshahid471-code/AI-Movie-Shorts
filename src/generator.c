@@ -1851,7 +1851,13 @@ static bool piper_tts_to_mp3(const Config *cfg, const char *model, const char *t
   if (cfg->piper_path[0]) {
     ok = piper_try_tool(cfg->piper_path, m_esc, o_esc, t_esc, tmp_wav);
   } else {
-    ok = piper_try_tool("piper/piper.exe", m_esc, o_esc, t_esc, tmp_wav);   /* project-local */
+#ifdef _WIN32
+    /* cmd.exe (used by system()/popen on Windows) cannot run "piper/piper.exe" -
+       it splits the command name at "/". Try the backslash form first. */
+    ok = piper_try_tool("piper\\piper.exe", m_esc, o_esc, t_esc, tmp_wav);
+    if (!ok) ok = piper_try_tool(".\\piper\\piper.exe", m_esc, o_esc, t_esc, tmp_wav);
+#endif
+    if (!ok) ok = piper_try_tool("piper/piper.exe", m_esc, o_esc, t_esc, tmp_wav);   /* project-local */
     if (!ok) ok = piper_try_tool("piper", m_esc, o_esc, t_esc, tmp_wav);    /* on PATH */
     if (!ok) ok = piper_try_tool("python3 -m piper", m_esc, o_esc, t_esc, tmp_wav);
     if (!ok) ok = piper_try_tool("python -m piper", m_esc, o_esc, t_esc, tmp_wav);
