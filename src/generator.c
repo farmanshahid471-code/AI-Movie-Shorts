@@ -524,8 +524,17 @@ static Config load_config_json(const char *path) {
   if (!txt) die("Missing config.json (expected at %s)", path);
 
   cJSON *root = cJSON_Parse(txt);
+  if (!root) {
+    const char *ep = cJSON_GetErrorPtr();
+    char snippet[80] = {0};
+    if (ep) snprintf(snippet, sizeof(snippet), "%.60s", ep);
+    free(txt);
+    if (snippet[0]) {
+      die("config.json has a JSON syntax error near: \"%s\"  (check for a missing comma, curly quotes \" \" instead of straight \", or extra/missing { } )", snippet);
+    }
+    die("config.json parse failed");
+  }
   free(txt);
-  if (!root) die("config.json parse failed");
 
   const cJSON *ok  = cJSON_GetObjectItemCaseSensitive(root, "open_api_key");
   const cJSON *dsk = cJSON_GetObjectItemCaseSensitive(root, "deepseek_api_key");
