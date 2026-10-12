@@ -255,6 +255,43 @@ Chinese, Arabic recaps, burned-in narration captions, etc.
 
 ---
 
+## VoiceStudio TTS (local, high-quality voices)
+
+Use the free **[VoiceStudio](https://github.com/debpalash/VoiceStudio)** desktop app as the
+voice engine (local API, voice cloning/design, big multilingual model catalog). The program
+talks to its local HTTP API — nothing is sent to the cloud.
+
+**1. Install VoiceStudio** on Windows (`.exe` from
+[Releases](https://github.com/debpalash/VoiceStudio/releases/latest), or in PowerShell:
+`irm https://voicestudio.sh/install | iex`), then in the app install a TTS engine
+(default **OmniVoice**) and pick or design the voices you like. Note the voice profile
+**names** (or IDs) from the app's voice list.
+
+**2. Keep the VoiceStudio app running** while generating recaps (its local API listens on
+`http://127.0.0.1:3900`).
+
+**3. Set the provider** in `config.json` (optional keys shown with their defaults):
+
+```json
+{
+  "tts_provider": "voicestudio",
+  "voicestudio_url": "http://127.0.0.1:3900",
+  "voicestudio_model": "omnivoice",
+  "tts_voices": {
+    "en": "your-english-voice-name",
+    "es": "your-spanish-voice-name",
+    "zh": "your-chinese-voice-name",
+    "ar": "your-arabic-voice-name"
+  }
+}
+```
+
+`tts_voices` entries are VoiceStudio voice profile names/IDs (see `GET /v1/audio/voices`
+on the local API); a language left out uses the app's `default` voice. Everything else
+works the same as with the other providers.
+
+---
+
 ## Build
 
 ```bash

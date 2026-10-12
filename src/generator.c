@@ -505,9 +505,11 @@ typedef struct {
   char eleven_key[512];
   char eleven_voice_id[128];
   char eleven_model_id[128];
-  char tts_provider[32];     /* "elevenlabs" (default), "edge" or "piper" (offline) */
+  char tts_provider[32];     /* "elevenlabs" (default), "edge", "piper" (offline) or "voicestudio" */
   char edge_voice[128];      /* Edge TTS voice, e.g. en-US-ChristopherNeural */
   char piper_path[512];      /* optional path to piper executable (else auto-detect) */
+  char voicestudio_url[256]; /* VoiceStudio backend base URL (default http://127.0.0.1:3900) */
+  char voicestudio_model[64];/* VoiceStudio engine id (default "omnivoice") */
   int  min_clips;            /* recap length knobs (defaults: 20 / 30) */
   int  max_clips;
   double max_video_speed;    /* cap on clip speed-up (default 1.75; config "max_video_speed") */
@@ -547,6 +549,8 @@ static Config load_config_json(const char *path) {
   const cJSON *tp  = cJSON_GetObjectItemCaseSensitive(root, "tts_provider");
   const cJSON *ev  = cJSON_GetObjectItemCaseSensitive(root, "edge_voice");
   const cJSON *pp  = cJSON_GetObjectItemCaseSensitive(root, "piper_path");
+  const cJSON *vsu = cJSON_GetObjectItemCaseSensitive(root, "voicestudio_url");
+  const cJSON *vsm = cJSON_GetObjectItemCaseSensitive(root, "voicestudio_model");
 
   if (cJSON_IsString(ok)  && ok->valuestring)  strncpy(c.openai_key, ok->valuestring, sizeof(c.openai_key)-1);
   if (cJSON_IsString(dsk) && dsk->valuestring) strncpy(c.deepseek_api_key, dsk->valuestring, sizeof(c.deepseek_api_key)-1);
@@ -559,10 +563,16 @@ static Config load_config_json(const char *path) {
   if (cJSON_IsString(tp)  && tp->valuestring)  strncpy(c.tts_provider, tp->valuestring, sizeof(c.tts_provider)-1);
   if (cJSON_IsString(ev)  && ev->valuestring)  strncpy(c.edge_voice, ev->valuestring, sizeof(c.edge_voice)-1);
   if (cJSON_IsString(pp)  && pp->valuestring)  strncpy(c.piper_path, pp->valuestring, sizeof(c.piper_path)-1);
+  if (cJSON_IsString(vsu) && vsu->valuestring) strncpy(c.voicestudio_url, vsu->valuestring, sizeof(c.voicestudio_url)-1);
+  if (cJSON_IsString(vsm) && vsm->valuestring) strncpy(c.voicestudio_model, vsm->valuestring, sizeof(c.voicestudio_model)-1);
 
   if (c.llm_provider[0] == 0) strncpy(c.llm_provider, "openai", sizeof(c.llm_provider)-1);
   if (c.tts_provider[0] == 0) strncpy(c.tts_provider, "elevenlabs", sizeof(c.tts_provider)-1);
   if (c.edge_voice[0] == 0)   strncpy(c.edge_voice, "en-US-ChristopherNeural", sizeof(c.edge_voice)-1);
+  if (c.voicestudio_url[0] == 0)   strncpy(c.voicestudio_url, "http://127.0.0.1:3900", sizeof(c.voicestudio_url)-1);
+  if (c.voicestudio_model[0] == 0) strncpy(c.voicestudio_model, "omnivoice", sizeof(c.voicestudio_model)-1);
+  { size_t z = strlen(c.voicestudio_url);
+    while (z > 0 && (c.voicestudio_url[z-1] == '/' || c.voicestudio_url[z-1] == ' ')) c.voicestudio_url[--z] = 0; }
 
   if (strcasecmp(c.llm_provider, "deepseek") == 0) {
     if (c.open_api_base[0] == 0) strncpy(c.open_api_base, "https://api.deepseek.com", sizeof(c.open_api_base)-1);
@@ -580,10 +590,12 @@ static Config load_config_json(const char *path) {
     /* Microsoft Edge TTS: no API key required */
   } else if (strcasecmp(c.tts_provider, "piper") == 0) {
     /* Piper offline TTS: no API key required; voice models live in piper_voices/ */
+  } else if (strcasecmp(c.tts_provider, "voicestudio") == 0) {
+    /* VoiceStudio local backend (OpenAI-compatible TTS): the VoiceStudio app must be running */
   } else if (strcasecmp(c.tts_provider, "elevenlabs") == 0) {
-    if (c.eleven_key[0] == 0) die("config.json: elevenlabs_api_key missing (or set \"tts_provider\": \"edge\" or \"piper\")");
+    if (c.eleven_key[0] == 0) die("config.json: elevenlabs_api_key missing (or set \"tts_provider\": \"edge\", \"piper\" or \"voicestudio\")");
   } else {
-    die("config.json: tts_provider must be \"elevenlabs\", \"edge\" or \"piper\" (got \"%s\")", c.tts_provider);
+    die("config.json: tts_provider must be \"elevenlabs\", \"edge\", \"piper\" or \"voicestudio\" (got \"%s\")", c.tts_provider);
   }
 
   if (c.eleven_voice_id[0] == 0) strncpy(c.eleven_voice_id, "JBFqnCBsd6RMkjVDRZzb", sizeof(c.eleven_voice_id)-1);
@@ -1897,7 +1909,80 @@ static bool piper_tts_to_mp3(const Config *cfg, const char *model, const char *t
   return ok && file_exists(out_mp3_path) && file_size_bytes(out_mp3_path) > 0;
 }
 
+/* ---------------- VoiceStudio local backend (OpenAI-compatible TTS) ----------------
+   Talks to the VoiceStudio desktop app's local API:
+     POST {voicestudio_url}/v1/audio/speech
+     {"model": engine, "input": text, "voice": profile, "response_format": "wav", "language": code}
+   "voice" is a VoiceStudio voice profile ID or name (see GET /v1/audio/voices), or "default".
+   Response is WAV; it is transcoded to mp3 like the piper path. */
+static const char *vs_voice_for_lang(const Config *cfg, const char *lang) {
+  for (int i = 0; i < cfg->recap_lang_count; i++)
+    if (strcasecmp(cfg->recap_languages[i], lang) == 0 && cfg->tts_voices[i][0])
+      return cfg->tts_voices[i];
+  return "default";
+}
+
+static bool voicestudio_tts_to_mp3(const Config *cfg, const char *lang,
+                                   const char *text, const char *out_mp3_path) {
+  char url[768];
+  snprintf(url, sizeof(url), "%s/v1/audio/speech", cfg->voicestudio_url);
+
+  cJSON *req = cJSON_CreateObject();
+  if (!req) return false;
+  cJSON_AddStringToObject(req, "model", cfg->voicestudio_model);
+  cJSON_AddStringToObject(req, "input", text);
+  cJSON_AddStringToObject(req, "voice", vs_voice_for_lang(cfg, lang));
+  cJSON_AddStringToObject(req, "response_format", "wav");
+  if (lang && lang[0]) cJSON_AddStringToObject(req, "language", lang);
+  char *body = cJSON_PrintUnformatted(req);
+  cJSON_Delete(req);
+  if (!body) return false;
+
+  long code = 0;
+  MemBuf buf = http_post_json_to_mem(url, "", body, &code, 300L);
+  free(body);
+
+  char tmp_wav[PATH_MAX];
+  snprintf(tmp_wav, sizeof(tmp_wav), "%s.wav", out_mp3_path);
+
+  if (code != 200 || !buf.data || buf.size < 128) {
+    logw("VoiceStudio TTS failed for %s (HTTP %ld). Start the VoiceStudio app so its local API runs on %s.", out_mp3_path, code, cfg->voicestudio_url);
+    if (buf.data && buf.size) {
+      size_t n = buf.size;
+      const char *shown = (n > 300) ? buf.data + n - 300 : buf.data;
+      logw("VoiceStudio response: %s%s", (n > 300) ? "...(truncated) " : "", shown);
+    }
+    if (buf.data) free(buf.data);
+    return false;
+  }
+
+  FILE *f = fopen(tmp_wav, "wb");
+  if (!f) {
+    logw("VoiceStudio: cannot write %s", tmp_wav);
+    free(buf.data);
+    return false;
+  }
+  fwrite(buf.data, 1, buf.size, f);
+  fclose(f);
+  free(buf.data);
+
+  /* WAV -> mp3, same as the piper path */
+  char *w_esc = sh_escape(tmp_wav);
+  char *p_esc = sh_escape(out_mp3_path);
+  int rc = run_cmd("ffmpeg -y -hide_banner -loglevel error -i %s -c:a libmp3lame -b:a 128k %s", w_esc, p_esc);
+  free(w_esc);
+  free(p_esc);
+  if (rc != 0 || !file_exists(out_mp3_path) || file_size_bytes(out_mp3_path) <= 0) {
+    rename(tmp_wav, out_mp3_path);   /* fallback: WAV content under this name still plays */
+  }
+  unlink(tmp_wav);
+  return file_exists(out_mp3_path) && file_size_bytes(out_mp3_path) > 0;
+}
+
 static bool tts_to_mp3(const Config *cfg, const char *lang, const char *text, const char *out_mp3_path) {
+  if (strcasecmp(cfg->tts_provider, "voicestudio") == 0) {
+    return voicestudio_tts_to_mp3(cfg, lang, text, out_mp3_path);
+  }
   if (strcasecmp(cfg->tts_provider, "edge") == 0) {
     return edge_tts_to_mp3(voice_for_lang(cfg, lang), text, out_mp3_path);
   }
