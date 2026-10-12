@@ -505,8 +505,9 @@ typedef struct {
   char eleven_key[512];
   char eleven_voice_id[128];
   char eleven_model_id[128];
-  char tts_provider[32];     /* "elevenlabs" (default) or "edge" */
+  char tts_provider[32];     /* "elevenlabs" (default), "edge" or "piper" (offline) */
   char edge_voice[128];      /* Edge TTS voice, e.g. en-US-ChristopherNeural */
+  char piper_path[512];      /* optional path to piper executable (else auto-detect) */
   int  min_clips;            /* recap length knobs (defaults: 20 / 30) */
   int  max_clips;
   /* multi-language recap (default: English only, behavior unchanged) */
@@ -535,6 +536,7 @@ static Config load_config_json(const char *path) {
   const cJSON *mid = cJSON_GetObjectItemCaseSensitive(root, "eleven_model_id");
   const cJSON *tp  = cJSON_GetObjectItemCaseSensitive(root, "tts_provider");
   const cJSON *ev  = cJSON_GetObjectItemCaseSensitive(root, "edge_voice");
+  const cJSON *pp  = cJSON_GetObjectItemCaseSensitive(root, "piper_path");
 
   if (cJSON_IsString(ok)  && ok->valuestring)  strncpy(c.openai_key, ok->valuestring, sizeof(c.openai_key)-1);
   if (cJSON_IsString(dsk) && dsk->valuestring) strncpy(c.deepseek_api_key, dsk->valuestring, sizeof(c.deepseek_api_key)-1);
@@ -546,6 +548,7 @@ static Config load_config_json(const char *path) {
   if (cJSON_IsString(mid) && mid->valuestring) strncpy(c.eleven_model_id, mid->valuestring, sizeof(c.eleven_model_id)-1);
   if (cJSON_IsString(tp)  && tp->valuestring)  strncpy(c.tts_provider, tp->valuestring, sizeof(c.tts_provider)-1);
   if (cJSON_IsString(ev)  && ev->valuestring)  strncpy(c.edge_voice, ev->valuestring, sizeof(c.edge_voice)-1);
+  if (cJSON_IsString(pp)  && pp->valuestring)  strncpy(c.piper_path, pp->valuestring, sizeof(c.piper_path)-1);
 
   if (c.llm_provider[0] == 0) strncpy(c.llm_provider, "openai", sizeof(c.llm_provider)-1);
   if (c.tts_provider[0] == 0) strncpy(c.tts_provider, "elevenlabs", sizeof(c.tts_provider)-1);
@@ -565,10 +568,12 @@ static Config load_config_json(const char *path) {
 
   if (strcasecmp(c.tts_provider, "edge") == 0) {
     /* Microsoft Edge TTS: no API key required */
+  } else if (strcasecmp(c.tts_provider, "piper") == 0) {
+    /* Piper offline TTS: no API key required; voice models live in piper_voices/ */
   } else if (strcasecmp(c.tts_provider, "elevenlabs") == 0) {
-    if (c.eleven_key[0] == 0) die("config.json: elevenlabs_api_key missing (or set \"tts_provider\": \"edge\")");
+    if (c.eleven_key[0] == 0) die("config.json: elevenlabs_api_key missing (or set \"tts_provider\": \"edge\" or \"piper\")");
   } else {
-    die("config.json: tts_provider must be \"elevenlabs\" or \"edge\" (got \"%s\")", c.tts_provider);
+    die("config.json: tts_provider must be \"elevenlabs\", \"edge\" or \"piper\" (got \"%s\")", c.tts_provider);
   }
 
   if (c.eleven_voice_id[0] == 0) strncpy(c.eleven_voice_id, "JBFqnCBsd6RMkjVDRZzb", sizeof(c.eleven_voice_id)-1);
@@ -1755,9 +1760,115 @@ static bool edge_tts_to_mp3(const char *voice, const char *text, const char *out
   return ok;
 }
 
+/* ---------------- Piper offline TTS (no internet needed) ---------------- */
+static const char *piper_default_model(const char *code) {
+  static const struct { const char *code; const char *model; } m[] = {
+    {"en", "piper_voices/en_US-joe-medium.onnx"},
+    {"es", "piper_voices/es_MX-claude-high.onnx"},
+    {"zh", "piper_voices/zh_CN-huayan-medium.onnx"},
+    {"ar", "piper_voices/ar_JO-kareem-medium.onnx"},
+  };
+  for (size_t i = 0; i < sizeof(m) / sizeof(m[0]); i++)
+    if (strcasecmp(m[i].code, code) == 0) return m[i].model;
+  return "piper_voices/en_US-joe-medium.onnx";
+}
+
+/* For tts_provider "piper", a tts_voices entry may point at any .onnx model.
+   Entries that are not model paths (e.g. leftover Edge voice names) are ignored. */
+static const char *model_for_lang(const Config *cfg, const char *lang) {
+  static bool warned = false;
+  for (int i = 0; i < cfg->recap_lang_count; i++) {
+    if (strcasecmp(cfg->recap_languages[i], lang) == 0 && cfg->tts_voices[i][0]) {
+      const char *v = cfg->tts_voices[i];
+      size_t l = strlen(v);
+      if ((l > 5 && strcasecmp(v + l - 5, ".onnx") == 0) || file_exists(v)) return v;
+      if (!warned) {
+        logw("tts_voices[\"%s\"] = \"%s\" is not a Piper model path (needs a .onnx file); using the default model.", lang, v);
+        warned = true;
+      }
+      break;
+    }
+  }
+  return piper_default_model(lang);
+}
+
+static bool piper_try_tool(const char *tool, const char *model_esc, const char *out_esc,
+                           const char *txt_esc, const char *out_wav) {
+  static const char *flag_variants[] = { "--output-file", "--output_file" };
+  char cmd[8192];
+  for (size_t v = 0; v < sizeof(flag_variants) / sizeof(flag_variants[0]); v++) {
+    snprintf(cmd, sizeof(cmd), "%s --model %s %s %s < %s 2>&1",
+             tool, model_esc, flag_variants[v], out_esc, txt_esc);
+    char *out = popen_read_all(cmd);
+    bool ok = file_exists(out_wav) && file_size_bytes(out_wav) > 0;
+    if (!ok && out && out[0]) logw("piper (%s %s) output: %.400s", tool, flag_variants[v], out);
+    if (out) free(out);
+    if (ok) return true;
+    unlink(out_wav);
+  }
+  return false;
+}
+
+static bool piper_tts_to_mp3(const Config *cfg, const char *model, const char *text,
+                             const char *out_mp3_path) {
+  if (!model || !model[0] || !file_exists(model)) {
+    logw("Piper voice model not found: %s", model ? model : "(none)");
+    logw("Download the .onnx + .onnx.json into piper_voices/ (see README: Offline TTS).");
+    return false;
+  }
+
+  char tmp_txt[PATH_MAX], tmp_wav[PATH_MAX];
+  snprintf(tmp_txt, sizeof(tmp_txt), "%s.txt", out_mp3_path);
+  snprintf(tmp_wav, sizeof(tmp_wav), "%s.wav", out_mp3_path);
+  if (!write_entire_file(tmp_txt, text, strlen(text))) {
+    logw("piper: failed to write temp text file: %s", tmp_txt);
+    return false;
+  }
+
+  char *m_esc = sh_escape(model);
+  char *o_esc = sh_escape(tmp_wav);
+  char *t_esc = sh_escape(tmp_txt);
+
+  bool ok = false;
+  if (cfg->piper_path[0]) {
+    ok = piper_try_tool(cfg->piper_path, m_esc, o_esc, t_esc, tmp_wav);
+  } else {
+    ok = piper_try_tool("piper/piper.exe", m_esc, o_esc, t_esc, tmp_wav);   /* project-local */
+    if (!ok) ok = piper_try_tool("piper", m_esc, o_esc, t_esc, tmp_wav);    /* on PATH */
+    if (!ok) ok = piper_try_tool("python3 -m piper", m_esc, o_esc, t_esc, tmp_wav);
+    if (!ok) ok = piper_try_tool("python -m piper", m_esc, o_esc, t_esc, tmp_wav);
+  }
+
+  if (ok) {
+    /* piper writes WAV; transcode to real mp3 (same format the rest of the pipeline expects) */
+    char *w_esc = sh_escape(tmp_wav);
+    char *p_esc = sh_escape(out_mp3_path);
+    int rc = run_cmd("ffmpeg -y -hide_banner -loglevel error -i %s -c:a libmp3lame -b:a 128k %s", w_esc, p_esc);
+    free(w_esc);
+    free(p_esc);
+    if (rc != 0 || !file_exists(out_mp3_path) || file_size_bytes(out_mp3_path) <= 0) {
+      rename(tmp_wav, out_mp3_path);   /* fallback: WAV content under this name still plays */
+    }
+    unlink(tmp_wav);
+  }
+
+  unlink(tmp_txt);
+  free(m_esc);
+  free(o_esc);
+  free(t_esc);
+
+  if (!ok) {
+    logw("Piper TTS failed for %s. Install the piper tool (see README: Offline TTS).", out_mp3_path);
+  }
+  return ok && file_exists(out_mp3_path) && file_size_bytes(out_mp3_path) > 0;
+}
+
 static bool tts_to_mp3(const Config *cfg, const char *lang, const char *text, const char *out_mp3_path) {
   if (strcasecmp(cfg->tts_provider, "edge") == 0) {
     return edge_tts_to_mp3(voice_for_lang(cfg, lang), text, out_mp3_path);
+  }
+  if (strcasecmp(cfg->tts_provider, "piper") == 0) {
+    return piper_tts_to_mp3(cfg, model_for_lang(cfg, lang), text, out_mp3_path);
   }
   return elevenlabs_tts_to_mp3(cfg, text, out_mp3_path);
 }

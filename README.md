@@ -208,6 +208,50 @@ Popular English voices for movie-recap style narration:
 
 Full list: `edge-tts --list-voices` (or https://gist.github.com/BettyJJ/17cbaa1de96235a7f5773b8690a20462).
 
+### Offline TTS (Piper) — no internet, no errors
+
+Edge TTS is a **cloud** service: each clip is synthesized online, so slow or flaky
+internet can make a few clips fail with websocket errors. **Piper** is a free neural
+TTS that runs **entirely on your PC** — install it once and voice generation never
+needs the internet again.
+
+**1. Install the piper tool** (one of these):
+
+- Easiest: download the Windows build
+  https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper-2023.11.14-2-windows-x64.zip
+  and extract it **into your project** so you get a `piper\` folder next to `config.json`
+  (it must keep `piper.exe` and `espeak-ng-data` together). On the F: drive that would be
+  `F:\AI-Movie-Shorts1\piper\`.
+- Or: `pip install piper-tts` (then no folder is needed).
+
+If piper lives somewhere else, set `"piper_path": "F:/piper/piper.exe"` in `config.json`.
+
+**2. Download 4 voice models** into a `piper_voices\` folder in the project
+(`F:\AI-Movie-Shorts1\piper_voices\`). Each voice needs **two** files (`.onnx` and
+`.onnx.json`) — download all 8 links:
+
+| Language | Files |
+|---|---|
+| English | https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/joe/medium/en_US-joe-medium.onnx<br>https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/joe/medium/en_US-joe-medium.onnx.json |
+| Spanish (LatAm) | https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/es/es_MX/claude/high/es_MX-claude-high.onnx<br>https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/es/es_MX/claude/high/es_MX-claude-high.onnx.json |
+| Chinese (Simplified) | https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx<br>https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json |
+| Arabic | https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ar/ar_JO/kareem/medium/ar_JO-kareem-medium.onnx<br>https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ar/ar_JO/kareem/medium/ar_JO-kareem-medium.onnx.json |
+
+More voices: https://rhasspy.github.io/piper-samples/ (any `.onnx` works — point to it
+in `tts_voices`, e.g. `"en": "piper_voices/en_US-libritts_r-medium.onnx"`).
+
+**3. Set the provider** in `config.json`:
+
+```json
+{
+  "tts_provider": "piper"
+}
+```
+
+That's it — `tts_voices` / `edge_voice` are not needed for Piper (the language defaults
+above are used automatically). Everything else works the same: English, Spanish,
+Chinese, Arabic recaps, burned-in narration captions, etc.
+
 ---
 
 ## Build
