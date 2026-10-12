@@ -28,8 +28,15 @@ set "MSYS2ROOT=F:\New folder (3)"
 set "BASH=%MSYS2ROOT%\usr\bin\bash.exe"
 set "PS=powershell -NoProfile -ExecutionPolicy Bypass -Command"
 set "CURL=%SystemRoot%\System32\curl.exe"
+if exist "%CURL%" goto :have_curl
+set "CURL=%MSYS2ROOT%\mingw64\bin\curl.exe"
+if exist "%CURL%" goto :have_curl
+set "CURL=%MSYS2ROOT%\usr\bin\curl.exe"
+if exist "%CURL%" goto :have_curl
+set "CURL="
+:have_curl
 set "CODE_URL=https://github.com/farmanshahid471-code/AI-Movie-Shorts/archive/refs/heads/arena/a8b45986-ai-movie-shorts.zip"
-set "PIPER_URL=https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper-2023.11.14-2-windows-x64.zip"
+set "PIPER_URL=https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_windows_amd64.zip"
 set "VOICE_URL=https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0"
 set "DEPFLAGS=-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
 if exist "F:\deps\raylib\." if exist "F:\deps\cjson\." set "DEPFLAGS=-DFETCHCONTENT_SOURCE_DIR_RAYLIB=/f/deps/raylib -DFETCHCONTENT_SOURCE_DIR_CJSON=/f/deps/cjson -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
@@ -52,7 +59,7 @@ echo       Folder OK.
 echo(
 
 echo [2/7] Downloading the latest code from GitHub...
-set "ERRMSG=Could not download the code zip from GitHub. Check your internet connection and try again."
+set "ERRMSG=Could not download the code zip from GitHub. See the error message above."
 call :dl "%CODE_URL%" "%WORK%\code.zip"
 if errorlevel 1 goto :fail
 
@@ -78,9 +85,9 @@ echo(
 
 echo [4/7] Checking Piper TTS...
 if exist "%ROOT%\piper\piper.exe" goto :have_piper
-echo       Installing Piper into the piper folder - one-time download.
+echo       Installing Piper into the piper folder - one-time download of about 21 MB.
 mkdir "%ROOT%\piper" 2>nul
-set "ERRMSG=Could not download the Piper zip from GitHub. Check your internet connection and try again."
+set "ERRMSG=Could not download the Piper zip from GitHub. See the error message above."
 call :dl "%PIPER_URL%" "%WORK%\piper.zip"
 if errorlevel 1 goto :fail
 set "ERRMSG=Could not unpack the Piper zip. Run update.bat again."
@@ -205,7 +212,7 @@ rem ----------------------------------------------------------------
 :dl
 if exist "%~2" goto :dl_have
 echo       downloading: %~nx2
-if exist "%CURL%" goto :dl_curl
+if defined CURL goto :dl_curl
 %PS% "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '%~1' -OutFile '%~2'"
 if errorlevel 1 goto :dl_fail
 exit /b 0
