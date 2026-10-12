@@ -1744,7 +1744,10 @@ static bool edge_tts_try_tool(const char *tool, const char *txt_esc, const char 
   char *out = popen_read_all(cmd);
   bool ok = file_exists(out_mp3_path) && file_size_bytes(out_mp3_path) > 0;
   if (!ok && out && out[0]) {
-    logw("edge-tts (%s) output: %.400s", tool, out);
+    /* Show the END of the output: in a traceback the real error is the last line. */
+    size_t n = strlen(out);
+    const char *shown = (n > 400) ? out + n - 400 : out;
+    logw("edge-tts (%s) output: %s%.400s", tool, (n > 400) ? "...(truncated) " : "", shown);
   }
   if (out) free(out);
   return ok;
@@ -1773,7 +1776,8 @@ static bool edge_tts_to_mp3(const char *voice, const char *text, const char *out
   unlink(tmp_txt);
 
   if (!ok) {
-    logw("Edge TTS failed for %s. Install it with: pip install edge-tts", out_mp3_path);
+    logw("Edge TTS failed for %s.", out_mp3_path);
+    logw("If the output above shows a 403, 429 or connection error, Microsoft's TTS service is refusing the request (rate limit or block) - use \"tts_provider\": \"piper\" (offline) or try again later. If it says the tool is missing, install it with: pip install edge-tts");
   }
   return ok;
 }
@@ -1819,7 +1823,13 @@ static bool piper_try_tool(const char *tool, const char *model_esc, const char *
              tool, model_esc, flag_variants[v], out_esc, txt_esc);
     char *out = popen_read_all(cmd);
     bool ok = file_exists(out_wav) && file_size_bytes(out_wav) > 0;
-    if (!ok && out && out[0]) logw("piper (%s %s) output: %.400s", tool, flag_variants[v], out);
+    if (!ok && out && out[0]) {
+      /* Show the END of the output: in a traceback the real error is the last line. */
+      size_t n = strlen(out);
+      const char *shown = (n > 400) ? out + n - 400 : out;
+      logw("piper (%s %s) output: %s%.400s", tool, flag_variants[v],
+           (n > 400) ? "...(truncated) " : "", shown);
+    }
     if (out) free(out);
     if (ok) return true;
     unlink(out_wav);
