@@ -510,6 +510,7 @@ typedef struct {
   char piper_path[512];      /* optional path to piper executable (else auto-detect) */
   int  min_clips;            /* recap length knobs (defaults: 20 / 30) */
   int  max_clips;
+  double max_video_speed;    /* cap on clip speed-up (default 1.75; config "max_video_speed") */
   /* multi-language recap (default: English only, behavior unchanged) */
   char recap_languages[8][16];
   int  recap_lang_count;
@@ -586,6 +587,14 @@ static Config load_config_json(const char *path) {
   if (c.min_clips <= 0) c.min_clips = MIN_NUM_CLIPS;
   if (c.max_clips <= 0) c.max_clips = MAX_NUM_CLIPS;
   if (c.max_clips < c.min_clips) c.max_clips = c.min_clips;
+
+  const cJSON *mvs = cJSON_GetObjectItemCaseSensitive(root, "max_video_speed");
+  if (cJSON_IsNumber(mvs) && mvs->valuedouble >= 0.5 && mvs->valuedouble <= 4.0) {
+    c.max_video_speed = mvs->valuedouble;
+  } else {
+    if (mvs && !cJSON_IsNull(mvs)) logw("config.json: max_video_speed should be a number between 0.5 and 4.0 (using default %.2f)", MAX_VIDEO_SPEEDUP);
+    c.max_video_speed = MAX_VIDEO_SPEEDUP;
+  }
 
   c.recap_lang_count = 0;
   const cJSON *langs = cJSON_GetObjectItemCaseSensitive(root, "recap_languages");
@@ -1997,7 +2006,9 @@ static bool write_narration_srt(const char *narration, double total_src_seconds,
 
 static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int end_s,
                                       const char *narration_mp3, double narration_dur,
-                                      const char *out_mp4, bool burn_subs, const char *narration_text) {
+                                      const char *out_mp4, bool burn_subs, const char *narration_text,
+                                      double max_speed) {
+  if (max_speed < 0.5) max_speed = MAX_VIDEO_SPEEDUP;
   double orig_seg_dur = (double)(end_s - start_s);
   if (orig_seg_dur <= 0.1 || narration_dur <= 0.1) return false;
 
@@ -2006,8 +2017,8 @@ static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int en
 
   double speed = orig_seg_dur / narration_dur;
 
-  if (speed > MAX_VIDEO_SPEEDUP) {
-    double desired_src_dur = narration_dur * MAX_VIDEO_SPEEDUP;
+  if (speed > max_speed) {
+    double desired_src_dur = narration_dur * max_speed;
 
     if (desired_src_dur > orig_seg_dur) desired_src_dur = orig_seg_dur;
     if (desired_src_dur < 1.0) desired_src_dur = 1.0;
@@ -2030,7 +2041,7 @@ static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int en
 
     double new_seg_dur = (double)(use_end - use_start);
     speed = new_seg_dur / narration_dur;
-    if (speed > MAX_VIDEO_SPEEDUP) speed = MAX_VIDEO_SPEEDUP;
+    if (speed > max_speed) speed = max_speed;
 
     logi("Speed-cap applied: planned %d-%d (%.2fs) vs narr %.2fs => %.2fx. Using %d-%d (%.2fs) => %.2fx.",
          start_s, end_s, orig_seg_dur,
@@ -2444,7 +2455,8 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
 
     logi("Building clip %zu: %d -> %d sec (narr=%.2fs) => %s", i + 1, start_s, end_s, nar_dur, out_clip);
     if (!ffmpeg_make_adjusted_clip(movie_path, start_s, end_s, nar_mp3, nar_dur, out_clip,
-                                   cfg->burn_subtitles, plan.items[i].narration)) {
+                                   cfg->burn_subtitles, plan.items[i].narration,
+                                   cfg->max_video_speed)) {
       logw("Failed to build adjusted clip %zu", i + 1);
       continue;
     }

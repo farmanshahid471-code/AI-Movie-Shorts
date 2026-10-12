@@ -117,6 +117,7 @@ Notes:
 - `eleven_voice_id` defaults if omitted.
 - `eleven_model_id` defaults if omitted.
 - `min_clips` / `max_clips` control recap length (default 20–30). See **Recap length** below.
+- `max_video_speed` caps how fast clips may be sped up (default 1.75). See **Video speed** below.
 
 ### Using DeepSeek (OpenAI-compatible endpoint)
 
@@ -316,6 +317,30 @@ The recap lasts roughly `num_clips × 8–15 seconds` of narration. The default
   "max_clips": 60
 }
 ```
+
+---
+
+## Video speed (speed-cap)
+
+When a clip's movie slice is longer than its narration, the video is sped up to fit.
+`"max_video_speed"` caps how fast it may play (default **1.75**). Lower it to make the
+footage look calmer — the program then shows a **shorter slice** of the movie at a
+slower pace instead of zooming through it:
+
+```json
+{
+  "max_video_speed": 1.2
+}
+```
+
+- `1.75` — default (existing behavior)
+- `1.2` — mild speed-up at most
+- `1.0` — never faster than real time (each clip shows exactly as many seconds as the narration lasts)
+- allowed range: `0.5` – `4.0`
+
+Note: clips whose narration is *longer* than their movie slice still play in slight
+slow motion (the slice is stretched to cover the narration) — this cap only limits
+speed-**up**.
 
 ---
 
