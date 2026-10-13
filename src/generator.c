@@ -1365,6 +1365,25 @@ static void *xrealloc(void *p, size_t n) {
   return q;
 }
 
+static char *str_replace_first(const char *s, const char *old_lit, const char *new_lit) {
+  char *hit = strstr(s, old_lit);
+  if (!hit) return NULL;
+  size_t pre = (size_t)(hit - s), ol = strlen(old_lit), nl = strlen(new_lit);
+  size_t tl = strlen(hit + ol);
+  char *out = (char *)malloc(pre + nl + tl + 1);
+  if (!out) die("OOM");
+  memcpy(out, s, pre);
+  memcpy(out + pre, new_lit, nl);
+  memcpy(out + pre + nl, hit + ol, tl + 1);
+  return out;
+}
+
+/* A request body with the max_tokens field removed entirely (no cap at all). */
+static char *json_strip_max_tokens_field(const char *body) {
+  char *cut = str_replace_first(body, "\"max_tokens\":32768,", "");
+  return cut ? cut : strdup(body);
+}
+
 /* Recover complete clip objects from a truncated/invalid plan response.
  * Used ONLY when the strict parser finds nothing; a full response parses
  * through the strict path unchanged. */
@@ -1681,11 +1700,11 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     cJSON_AddItemToObject(req, "text", text);
   }
 
-  char *body = cJSON_PrintUnformatted(req);
+  char *body32 = cJSON_PrintUnformatted(req);
   cJSON_Delete(req);
   free(prompt);
 
-  if (!body) {
+  if (!body32) {
     ClipPlanList empty = {0};
     return empty;
   }
@@ -1694,83 +1713,90 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   bool has_script = (optional_script_text && optional_script_text[0] != 0);
   long timeout_s = has_script ? 14400L : 3600L;
 
-  MemBuf resp = http_post_json_to_mem(url, llm_api_key(cfg), body, &http_code, timeout_s);
+  /* Request variants, tried in order until a COMPLETE plan parses:
+   *  1. no max_tokens field at all (no cap from our side),
+   *  2. max_tokens=32768,
+   *  3. max_tokens=8192 (providers that reject larger budgets).
+   * If a variant is truncated, salvage keeps its complete clips and the next
+   * variant is tried; the longest plan wins. */
+  char *body_open = json_strip_max_tokens_field(body32);
+  char *body8 = str_replace_first(body32, "\"max_tokens\":32768", "\"max_tokens\":8192");
+  const char *variants[3];
+  int nvars = 0;
+  variants[nvars++] = body_open;
+  if (strstr(body32, "\"max_tokens\"")) {
+    variants[nvars++] = body32;
+    if (body8) variants[nvars++] = body8;
+  }
 
-  /* Some providers cap max_tokens lower than requested; retry once with 8192. */
-  if (http_code == 400 && resp.data && strstr(resp.data, "max_tokens")) {
-    char *hit = strstr(body, "\"max_tokens\":32768");
-    if (hit) {
-      size_t pre = (size_t)(hit - body);
-      const char *rep = "\"max_tokens\":8192";
-      size_t rl = strlen(rep);
-      const char *tail = hit + 18;
-      size_t tl = strlen(tail);
-      char *fixed = (char *)malloc(pre + rl + tl + 1);
-      if (!fixed) die("OOM");
-      memcpy(fixed, body, pre);
-      memcpy(fixed + pre, rep, rl);
-      memcpy(fixed + pre + rl, tail, tl + 1);
-      logw("LLM rejected max_tokens=32768; retrying with 8192.");
+  ClipPlanList best = {0};
+  char *diag_text = NULL;
+  for (int vi = 0; vi < nvars; vi++) {
+    MemBuf resp = http_post_json_to_mem(url, llm_api_key(cfg), variants[vi], &http_code, timeout_s);
+
+    if (http_code < 200 || http_code >= 300) {
+      logw("LLM HTTP %ld (request variant %d/%d)", http_code, vi + 1, nvars);
+      if (resp.data && resp.size) logw("LLM raw body: %.800s", resp.data);
+      if (has_script && resp.data && openai_resp_should_retry_without_script(resp.data)) {
+        if (out_retry_without_script) *out_retry_without_script = true;
+      }
       free(resp.data);
-      resp.data = NULL;
-      resp.size = 0;
-      free(body);
-      body = fixed;
-      resp = http_post_json_to_mem(url, llm_api_key(cfg), body, &http_code, timeout_s);
-    }
-  }
-  free(body);
-
-  if (http_code < 200 || http_code >= 300) {
-    logw("LLM HTTP %ld", http_code);
-    if (resp.data && resp.size) logw("LLM raw body: %.800s", resp.data);
-
-    if (has_script && resp.data && openai_resp_should_retry_without_script(resp.data)) {
-      if (out_retry_without_script) *out_retry_without_script = true;
+      continue;
     }
 
-    if (resp.data) free(resp.data);
-    ClipPlanList empty = {0};
-    return empty;
-  }
-
-  char *out_text = llm_uses_chat_completions(cfg)
-                     ? llm_chat_extract_message_content(resp.data ? resp.data : "")
-                     : openai_extract_output_text(resp.data ? resp.data : "");
-  if (!out_text) {
-    logw("LLM response parse failed.");
-    if (resp.data && resp.size) logw("LLM raw body: %.800s", resp.data);
-
-    if (has_script && resp.data && openai_resp_should_retry_without_script(resp.data)) {
-      if (out_retry_without_script) *out_retry_without_script = true;
+    char *out_text = llm_uses_chat_completions(cfg)
+                       ? llm_chat_extract_message_content(resp.data ? resp.data : "")
+                       : openai_extract_output_text(resp.data ? resp.data : "");
+    if (!out_text) {
+      logw("LLM response parse failed (request variant %d/%d).", vi + 1, nvars);
+      if (resp.data && resp.size) logw("LLM raw body: %.800s", resp.data);
+      if (has_script && resp.data && openai_resp_should_retry_without_script(resp.data)) {
+        if (out_retry_without_script) *out_retry_without_script = true;
+      }
+      free(resp.data);
+      continue;
     }
 
-    if (resp.data) free(resp.data);
-    ClipPlanList empty = {0};
-    return empty;
-  }
-
-  ClipPlanList plan = parse_clip_plan_json(out_text);
-  if (plan.count == 0 && out_text && out_text[0]) {
-    ClipPlanList salv = parse_clip_plan_json_lenient(out_text);
-    if (salv.count > 0) {
-      logw("Recovered %zu clip(s) from a truncated plan response (output was cut mid-JSON).",
-           salv.count);
-      plan = salv;
+    ClipPlanList plan = parse_clip_plan_json(out_text);
+    bool complete = plan.count > 0;
+    if (!complete) {
+      plan = parse_clip_plan_json_lenient(out_text);
+      if (plan.count > 0)
+        logw("Recovered %zu clip(s) from a truncated plan response (output was cut mid-JSON).",
+             plan.count);
     }
-  }
-  if (plan.count == 0 && out_text && out_text[0]) {
-    size_t n = strlen(out_text);
-    if (n <= 900) {
-      logw("LLM returned no usable clip plan. Response: %s", out_text);
+    if (plan.count > best.count) {
+      free_clip_plan_list(&best);
+      best = plan;
     } else {
-      logw("LLM returned no usable clip plan (response %zu bytes). Head: %.500s", n, out_text);
-      logw("LLM response tail: %.300s", out_text + n - 300);
+      free_clip_plan_list(&plan);
     }
+    if (diag_text) free(diag_text);
+    diag_text = out_text;
+    free(resp.data);
+    if (complete) break;
   }
-  free(out_text);
-  if (resp.data) free(resp.data);
-  return plan;
+
+  free(body_open);
+  free(body32);
+  free(body8);
+
+  if (best.count == 0) {
+    if (diag_text && diag_text[0]) {
+      size_t n = strlen(diag_text);
+      if (n <= 900) {
+        logw("LLM returned no usable clip plan. Response: %s", diag_text);
+      } else {
+        logw("LLM returned no usable clip plan (response %zu bytes). Head: %.500s", n, diag_text);
+        logw("LLM response tail: %.300s", diag_text + n - 300);
+      }
+    }
+    free(diag_text);
+    ClipPlanList empty = {0};
+    return empty;
+  }
+  free(diag_text);
+  return best;
 }
 
 static bool elevenlabs_tts_to_mp3(const Config *cfg, const char *text, const char *out_mp3_path) {
