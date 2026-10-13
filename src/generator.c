@@ -1939,7 +1939,7 @@ static bool voicestudio_tts_to_mp3(const Config *cfg, const char *lang,
   if (!body) return false;
 
   long code = 0;
-  MemBuf buf = http_post_json_to_mem(url, "", body, &code, 300L);
+  MemBuf buf = http_post_json_to_mem(url, "", body, &code, 900L);
   free(body);
 
   char tmp_wav[PATH_MAX];
