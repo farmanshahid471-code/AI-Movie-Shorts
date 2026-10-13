@@ -1365,6 +1365,49 @@ static void *xrealloc(void *p, size_t n) {
   return q;
 }
 
+/* Recover complete clip objects from a truncated/invalid plan response.
+ * Used ONLY when the strict parser finds nothing; a full response parses
+ * through the strict path unchanged. */
+static ClipPlanList parse_clip_plan_json_lenient(const char *json_text) {
+  ClipPlanList out = {0};
+  if (!json_text || !json_text[0]) return out;
+  size_t cap = 16;
+  out.items = (ClipPlan *)calloc(cap, sizeof(ClipPlan));
+  if (!out.items) die("OOM");
+
+  const char *p = json_text;
+  while ((p = strchr(p, '{')) != NULL) {
+    const char *end = NULL;
+    cJSON *obj = cJSON_ParseWithOpts(p, &end, 0);
+    if (obj && cJSON_IsObject(obj)) {
+      cJSON *s = cJSON_GetObjectItemCaseSensitive(obj, "start");
+      cJSON *e = cJSON_GetObjectItemCaseSensitive(obj, "end");
+      cJSON *nar = cJSON_GetObjectItemCaseSensitive(obj, "narration");
+      if (cJSON_IsNumber(s) && cJSON_IsNumber(e) && cJSON_IsString(nar) && nar->valuestring) {
+        if (out.count == cap) {
+          cap *= 2;
+          out.items = (ClipPlan *)xrealloc(out.items, cap * sizeof(ClipPlan));
+          memset(out.items + out.count, 0, (cap - out.count) * sizeof(ClipPlan));
+        }
+        out.items[out.count].start = s->valueint;
+        out.items[out.count].end = e->valueint;
+        out.items[out.count].narration = strdup(nar->valuestring);
+        out.count++;
+        cJSON_Delete(obj);
+        if (end && end > p) { p = end; } else { p++; }
+        continue;
+      }
+    }
+    if (obj) cJSON_Delete(obj);
+    p++;
+  }
+  if (out.count == 0) {
+    free(out.items);
+    out.items = NULL;
+  }
+  return out;
+}
+
 static char *sanitize_utf8_lossy(const char *in) {
   if (!in) return strdup("");
   size_t n = strlen(in);
@@ -1590,7 +1633,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     snprintf(url, sizeof(url), "%s/chat/completions", base);
 
     cJSON_AddStringToObject(req, "model", cfg->open_model[0] ? cfg->open_model : "gpt-5.2");
-    cJSON_AddNumberToObject(req, "max_tokens", 8192);
+    cJSON_AddNumberToObject(req, "max_tokens", 32768);
 
     cJSON *messages = cJSON_CreateArray();
 
@@ -1652,6 +1695,30 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   long timeout_s = has_script ? 14400L : 3600L;
 
   MemBuf resp = http_post_json_to_mem(url, llm_api_key(cfg), body, &http_code, timeout_s);
+
+  /* Some providers cap max_tokens lower than requested; retry once with 8192. */
+  if (http_code == 400 && resp.data && strstr(resp.data, "max_tokens")) {
+    char *hit = strstr(body, "\"max_tokens\":32768");
+    if (hit) {
+      size_t pre = (size_t)(hit - body);
+      const char *rep = "\"max_tokens\":8192";
+      size_t rl = strlen(rep);
+      const char *tail = hit + 18;
+      size_t tl = strlen(tail);
+      char *fixed = (char *)malloc(pre + rl + tl + 1);
+      if (!fixed) die("OOM");
+      memcpy(fixed, body, pre);
+      memcpy(fixed + pre, rep, rl);
+      memcpy(fixed + pre + rl, tail, tl + 1);
+      logw("LLM rejected max_tokens=32768; retrying with 8192.");
+      free(resp.data);
+      resp.data = NULL;
+      resp.size = 0;
+      free(body);
+      body = fixed;
+      resp = http_post_json_to_mem(url, llm_api_key(cfg), body, &http_code, timeout_s);
+    }
+  }
   free(body);
 
   if (http_code < 200 || http_code >= 300) {
@@ -1684,6 +1751,14 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   }
 
   ClipPlanList plan = parse_clip_plan_json(out_text);
+  if (plan.count == 0 && out_text && out_text[0]) {
+    ClipPlanList salv = parse_clip_plan_json_lenient(out_text);
+    if (salv.count > 0) {
+      logw("Recovered %zu clip(s) from a truncated plan response (output was cut mid-JSON).",
+           salv.count);
+      plan = salv;
+    }
+  }
   if (plan.count == 0 && out_text && out_text[0]) {
     size_t n = strlen(out_text);
     if (n <= 900) {
@@ -2176,10 +2251,15 @@ static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int en
   char *nar_esc = sh_escape(narration_mp3);
   char *out_esc = sh_escape(out_mp4);
 
-  char sub_filter[256] = {0};
+  char sub_filter[512] = {0};
   if (burn_subs && narration_text && narration_text[0]) {
-    if (write_narration_srt(narration_text, (double)(use_end - use_start), "clips/_clip_subs.srt")) {
-      snprintf(sub_filter, sizeof(sub_filter), "subtitles=filename='clips/_clip_subs.srt',");
+    /* Captions span the narration AUDIO duration (the output clock): the
+     * narration plays at normal speed from output t=0 while the video is
+     * time-scaled to match it, so syncing to the audio keeps text on voice. */
+    double cap_span = (narration_dur > 0.1) ? narration_dur : (double)(use_end - use_start);
+    if (write_narration_srt(narration_text, cap_span, "clips/_clip_subs.srt")) {
+      snprintf(sub_filter, sizeof(sub_filter),
+               "subtitles=filename='clips/_clip_subs.srt':force_style='Fontsize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,MarginV=25',");
     } else {
       logw("Subtitle burn: could not build narration captions for %s (clip continues without subs).", out_mp4);
     }
