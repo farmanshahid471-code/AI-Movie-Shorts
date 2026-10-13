@@ -1684,6 +1684,15 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   }
 
   ClipPlanList plan = parse_clip_plan_json(out_text);
+  if (plan.count == 0 && out_text && out_text[0]) {
+    size_t n = strlen(out_text);
+    if (n <= 900) {
+      logw("LLM returned no usable clip plan. Response: %s", out_text);
+    } else {
+      logw("LLM returned no usable clip plan (response %zu bytes). Head: %.500s", n, out_text);
+      logw("LLM response tail: %.300s", out_text + n - 300);
+    }
+  }
   free(out_text);
   if (resp.data) free(resp.data);
   return plan;
