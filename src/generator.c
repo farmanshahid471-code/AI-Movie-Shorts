@@ -2127,42 +2127,46 @@ static void cap_write_cue(FILE *out, int *cue_no, double cs, double ce, const ch
 static bool write_narration_srt(const char *narration, double total_src_seconds, const char *out_srt) {
   if (!narration || !narration[0] || total_src_seconds <= 0.1) return false;
 
-  /* 1. Split narration into sentence-like cues. */
-  char cues[MAX_CAP_CUES][512];
+  /* 1. Split narration into short cue lines on WORD boundaries (sentence
+   *    punctuation flushes immediately). Lines stay short (~22 chars) so they
+   *    fit the vertical crop of the video, and no text is ever dropped. */
+  char cues[MAX_CAP_CUES][768];
   int ncues = 0;
-  char cur[512];
-  size_t cl = 0;
+  char cur[768];
+  size_t cl = 0, last_boundary = 0;
   cur[0] = 0;
 
   const char *p = narration;
   bool need_space = false;
   while (*p && ncues < MAX_CAP_CUES) {
     if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
-      if (cl > 0) need_space = true;
+      if (cl > 0) { need_space = true; last_boundary = cl; }
       p++;
       continue;
     }
     size_t adv = 1;
     unsigned char c0 = (unsigned char)*p;
     if (c0 >= 0xF0) adv = 4; else if (c0 >= 0xE0) adv = 3; else if (c0 >= 0xC0) adv = 2;
+    if (need_space && cl > 0) {
+      if (cl + 1 < sizeof(cur)) { cur[cl++] = ' '; cur[cl] = 0; }
+    }
+    need_space = false;
     if (cl + adv + 2 >= sizeof(cur)) {
       memcpy(cues[ncues], cur, cl + 1);
       ncues++;
-      cl = 0; cur[0] = 0; need_space = false;
+      cl = 0; cur[0] = 0; last_boundary = 0;
       if (ncues >= MAX_CAP_CUES) break;
     }
-    if (need_space && cl > 0) { cur[cl++] = ' '; cur[cl] = 0; }
-    need_space = false;
     memcpy(cur + cl, p, adv);
     cl += adv;
     cur[cl] = 0;
     p += adv;
 
-    /* sentence end (ASCII or CJK punctuation) or very long cue → flush */
+    /* sentence end (ASCII or CJK punctuation) -> flush */
     bool sentence_end = false;
     unsigned char last = (unsigned char)cur[cl - 1];
     if (last == '.' || last == '!' || last == '?' || last == ':' || last == ';') sentence_end = true;
-    if (adv == 3 && cl >= 3) {   /* CJK terminators: 。 ！ ？ … */
+    if (adv == 3 && cl >= 3) {
       const char *lt = cur + cl - 3;
       if (memcmp(lt, "\xE3\x80\x82", 3) == 0 ||
           memcmp(lt, "\xEF\xBC\x81", 3) == 0 ||
@@ -2170,50 +2174,75 @@ static bool write_narration_srt(const char *narration, double total_src_seconds,
           memcmp(lt, "\xE2\x80\xA6", 3) == 0)
         sentence_end = true;
     }
-    if (sentence_end || utf8_count(cur) >= 40) {
-      memcpy(cues[ncues], cur, cl + 1);
+    int chars = utf8_count(cur);
+    if (sentence_end || chars >= 30 || (chars >= 22 && last_boundary > 0 && last_boundary < cl) ||
+        (adv == 3 && chars >= 18)) {
+      size_t split = (sentence_end || chars >= 30 || last_boundary == 0) ? cl : last_boundary;
+      if (split == 0 || split > cl) split = cl;
+      size_t klen = split;
+      while (klen > 0 && cur[klen - 1] == ' ') klen--;
+      memcpy(cues[ncues], cur, klen);
+      cues[ncues][klen] = 0;
       ncues++;
-      cl = 0; cur[0] = 0;
+      size_t rest = split;
+      while (rest < cl && cur[rest] == ' ') rest++;
+      memmove(cur, cur + rest, cl - rest + 1);
+      cl -= rest;
+      last_boundary = 0;
+      if (ncues >= MAX_CAP_CUES) break;
     }
   }
   if (cl > 0 && ncues < MAX_CAP_CUES) {
-    memcpy(cues[ncues], cur, cl + 1);
-    ncues++;
+    while (cl > 0 && cur[cl - 1] == ' ') cl--;
+    cur[cl] = 0;
+    if (cl > 0) { memcpy(cues[ncues], cur, cl + 1); ncues++; }
   }
   if (ncues == 0) return false;
 
-  /* 2. If more cues than the window can show, merge pairs until they fit. */
+  /* 2. If more cues than the window can show, merge the shortest adjacent
+   *    pair until they fit. Text is NEVER dropped to force a merge. */
   int max_cues = (int)(total_src_seconds / 0.8);
   if (max_cues < 1) max_cues = 1;
   if (max_cues > MAX_CAP_CUES) max_cues = MAX_CAP_CUES;
   while (ncues > max_cues) {
-    int best = 0, best_len = INT_MAX;
+    int best = -1, best_len = INT_MAX;
     for (int i = 0; i + 1 < ncues; i++) {
+      if (strlen(cues[i]) + strlen(cues[i + 1]) + 2 >= sizeof(cues[0])) continue;
       int l = utf8_count(cues[i]) + utf8_count(cues[i + 1]);
       if (l < best_len) { best_len = l; best = i; }
     }
-    if (strlen(cues[best]) + strlen(cues[best + 1]) + 2 < sizeof(cues[0])) {
-      strcat(cues[best], " ");
-      strcat(cues[best], cues[best + 1]);
-    }
+    if (best < 0) break;
+    /* join CJK sides without a space */
+    size_t la = strlen(cues[best]);
+    unsigned char ea = la ? (unsigned char)cues[best][la - 1] : 0;
+    unsigned char fb = (unsigned char)cues[best + 1][0];
+    int cjk_join = (ea >= 0xE0) && (fb >= 0xE0);
+    strcat(cues[best], cjk_join ? "" : " ");
+    strcat(cues[best], cues[best + 1]);
     for (int i = best + 1; i + 1 < ncues; i++) memcpy(cues[i], cues[i + 1], sizeof(cues[0]));
     ncues--;
   }
 
-  /* 3. Timing: proportional to caption length, min 0.4s each. */
+  /* 3. Timing: proportional to text weight (chars + punctuation pauses),
+   *    spanning the narration audio so captions track the voice. */
   long total_w = 0;
+  long wts[MAX_CAP_CUES];
   for (int i = 0; i < ncues; i++) {
     int w = utf8_count(cues[i]);
-    total_w += (w > 0 ? w : 1);
+    wts[i] = (w > 0 ? w : 1);
+    size_t L = strlen(cues[i]);
+    unsigned char e = L ? (unsigned char)cues[i][L - 1] : 0;
+    if (e == '.' || e == '!' || e == '?' || e == ':' || e == ';') wts[i] += 8;
+    else if (e == ',') wts[i] += 4;
+    total_w += wts[i];
   }
   FILE *out = fopen(out_srt, "wb");
   if (!out) return false;
   int cue_no = 0;
   double t = 0.0;
   for (int i = 0; i < ncues; i++) {
-    int w = utf8_count(cues[i]);
-    double dur = total_src_seconds * (double)(w > 0 ? w : 1) / (double)total_w;
-    if (dur < 0.4) dur = 0.4;
+    double dur = total_src_seconds * (double)wts[i] / (double)total_w;
+    if (dur < 0.35) dur = 0.35;
     double cs = t, ce = t + dur;
     if (ce > total_src_seconds) ce = total_src_seconds;
     if (i == ncues - 1) ce = total_src_seconds;
@@ -2285,7 +2314,7 @@ static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int en
     double cap_span = (narration_dur > 0.1) ? narration_dur : (double)(use_end - use_start);
     if (write_narration_srt(narration_text, cap_span, "clips/_clip_subs.srt")) {
       snprintf(sub_filter, sizeof(sub_filter),
-               "subtitles=filename='clips/_clip_subs.srt':force_style='Fontsize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,MarginV=25',");
+               "subtitles=filename='clips/_clip_subs.srt':force_style='Fontsize=18,Bold=1,PrimaryColour=&H00FFFFFF,BackColour=&H80000000,BorderStyle=3,Outline=2,Shadow=0,Alignment=2,MarginV=30',");
     } else {
       logw("Subtitle burn: could not build narration captions for %s (clip continues without subs).", out_mp4);
     }
