@@ -518,6 +518,7 @@ typedef struct {
   int  recap_lang_count;
   char tts_voices[8][128];   /* per-language TTS voice, aligned with recap_languages ("" = default) */
   bool burn_subtitles;
+  double bgm_volume;        /* background music volume 0.0-1.0 (default 0.1) */
 } Config;
 
 static Config load_config_json(const char *path) {
@@ -636,6 +637,16 @@ static Config load_config_json(const char *path) {
   }
 
   c.burn_subtitles = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "burn_subtitles"));
+
+  c.bgm_volume = 0.1;
+  {
+    const cJSON *bvol = cJSON_GetObjectItemCaseSensitive(root, "background_music_volume");
+    if (cJSON_IsNumber(bvol)) {
+      c.bgm_volume = bvol->valuedouble;
+      if (c.bgm_volume < 0.0) c.bgm_volume = 0.0;
+      if (c.bgm_volume > 1.0) c.bgm_volume = 1.0;
+    }
+  }
 
   const cJSON *tv = cJSON_GetObjectItemCaseSensitive(root, "tts_voices");
   if (cJSON_IsObject(tv)) {
@@ -2385,7 +2396,7 @@ static bool ffmpeg_concat_audio(const char *list_txt, const char *out_m4a) {
   return rc == 0 && file_exists(out_m4a);
 }
 
-static bool ffmpeg_mix_bgm(const char *video_in, const char *bgm_in, const char *video_out) {
+static bool ffmpeg_mix_bgm(const char *video_in, const char *bgm_in, const char *video_out, double bgm_vol) {
   char *v_esc = sh_escape(video_in);
   char *b_esc = sh_escape(bgm_in);
   char *o_esc = sh_escape(video_out);
@@ -2393,11 +2404,11 @@ static bool ffmpeg_mix_bgm(const char *video_in, const char *bgm_in, const char 
   int rc = run_cmd(
     "ffmpeg -y -hide_banner -loglevel error "
     "-i %s -i %s "
-    "-filter_complex \"[0:a]volume=2.5[a0];[1:a]volume=0.1[a1];"
+    "-filter_complex \"[0:a]volume=2.5[a0];[1:a]volume=%.3f[a1];"
     "[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[a]\" "
     "-map 0:v -map \"[a]\" "
     "-c:v copy -c:a aac -b:a 192k -movflags +faststart %s",
-    v_esc, b_esc, o_esc
+    v_esc, b_esc, bgm_vol, o_esc
   );
 
   free(v_esc);
@@ -2812,7 +2823,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
       snprintf(out_final_only, sizeof(out_final_only), "output/%s%s.mp4", movie_title, tag);
 
       logi("Mixing narration + BGM -> %s", out_final_only);
-      if (!ffmpeg_mix_bgm(tmp_concat, bgm_out, out_final_only)) {
+      if (!ffmpeg_mix_bgm(tmp_concat, bgm_out, out_final_only, cfg->bgm_volume)) {
         logw("Mix failed; output narration-only.");
         rename(tmp_concat, out_final_only);
       } else {
